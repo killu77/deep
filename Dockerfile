@@ -34,6 +34,7 @@ WORKDIR /app
 # ===== 关键修改：先创建用户，再以该用户身份安装浏览器 =====
 # 创建非 root 用户（提前创建）
 RUN useradd -m -u 1000 app_user
+RUN mkdir -p /home/app_user/.cache && chown -R app_user:app_user /home/app_user/.cache
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
@@ -45,6 +46,8 @@ RUN mkdir -p /opt/browsers && chmod 777 /opt/browsers
 
 # 安装 Playwright Firefox 到共享路径
 RUN python -m playwright install firefox
+# 将 /opt/browsers 的所有权改为 app_user（使后续写入 .links 等操作可行）
+RUN chown -R app_user:app_user /opt/browsers
 
 # ===== 预安装 Camoufox 浏览器 =====
 # 以 app_user 身份预下载 Camoufox 数据，避免运行时触发 GitHub API
