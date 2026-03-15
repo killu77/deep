@@ -87,16 +87,18 @@ async def _safe_initialize():
     global browser_mgr, keepalive_svc
     print("⏳ 后台任务：开始初始化浏览器...")
     try:
-        await asyncio.wait_for(browser_mgr.initialize(), timeout=120)
+        # 给 Playwright 足够的启动时间（180秒）
+        await asyncio.wait_for(browser_mgr.initialize(), timeout=180)
         print("✅ 后台任务：浏览器初始化完成。")
         if keepalive_svc and not keepalive_svc.is_running:
             await keepalive_svc.start()
     except asyncio.TimeoutError:
-        print("❌ 后台任务：浏览器初始化超时（120秒）")
+        print("❌ 后台任务：浏览器初始化超时（180秒）")
     except Exception as e:
         print(f"❌ 后台任务：浏览器初始化失败: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 app = FastAPI(title="DeepSeek Proxy", lifespan=lifespan)
