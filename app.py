@@ -1,6 +1,7 @@
 """
 主服务器：FastAPI + WebSocket 代理
 外部请求通过 HTTP/WebSocket 进入，由内部浏览器在已认证的上下文中执行。
+支持通过环境变量 API_SECRET_KEY 设置 API 密钥鉴权。
 """
 
 import os
@@ -12,18 +13,61 @@ import time
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import uvicorn
 
 from browser_manager import BrowserManager
 from keepalive import KeepaliveService
 
 # ============================================================
-# 全局实例
+# 全局实例 & 配置
 # ============================================================
 browser_mgr: BrowserManager = None
 keepalive_svc: KeepaliveService = None
+
+# API 密钥鉴权：从环境变量读取，默认值 zxcvbnm
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "zxcvbnm")
+security = HTTPBearer(auto_error=False)
+
+
+def verify_api_key(request: Request):
+    """
+    验证 API 密钥。支持三种传递方式：
+    1. Authorization: Bearer <key>
+    2. X-API-Key: <key>
+    3. 查询参数 ?api_key=<key>
+    """
+    # 方式1: Authorization Bearer
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        if token == API_SECRET_KEY:
+            return True
+
+    # 方式2: X-API-Key header
+    x_api_key = request.headers.get("x-api-key", "").strip()
+    if x_api_key == API_SECRET_KEY:
+        return True
+
+    # 方式3: 查询参数
+    api_key_param = request.query_params.get("api_key", "").strip()
+    if api_key_param == API_SECRET_KEY:
+        return True
+
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "error": {
+                "message": "Invalid API key. Please provide a valid key via "
+                           "'Authorization: Bearer <key>' header, "
+                           "'X-API-Key: <key>' header, or '?api_key=<key>' query param.",
+                "type": "invalid_request_error",
+                "code": "invalid_api_key",
+            }
+        },
+    )
 
 
 # ============================================================
@@ -36,6 +80,7 @@ async def lifespan(app: FastAPI):
 
     print(f"\n{'='*60}")
     print(f"  应用启动 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  API_SECRET_KEY: {API_SECRET_KEY[:3]}{'*' * (len(API_SECRET_KEY) - 3)}")
     print(f"{'='*60}\n")
 
     browser_mgr = BrowserManager()
@@ -72,7 +117,7 @@ app = FastAPI(title="DeepSeek Proxy", lifespan=lifespan)
 
 
 # ============================================================
-# 健康检查 & 状态页
+# 健康检查 & 状态页（不需要鉴权）
 # ============================================================
 @app.get("/")
 async def index():
@@ -111,12 +156,16 @@ async def index():
             <div class="info">
                 <div><span class="label">运行时间：</span>{hours}h {minutes}m {seconds}s</div>
                 <div><span class="label">登录状态：</span>{"✅ 已登录" if status.get("logged_in") else "❌ 未登录"}</div>
+                <div><span class="label">引擎：</span>{status.get("engine", "N/A")}</div>
                 <div><span class="label">心跳次数：</span>{status.get("heartbeat_count", 0)}</div>
                 <div><span class="label">处理请求：</span>{status.get("requests_handled", 0)}</div>
+                <div><span class="label">API鉴权：</span>✅ 已启用</div>
             </div>
             <p style="color: #8b949e; font-size: 12px;">
-                POST /v1/chat/completions 发送聊天请求<br>
-                WS /ws 建立 WebSocket 连接
+                POST /v1/chat/completions 发送聊天请求（需要 API Key）<br>
+                WS /ws 建立 WebSocket 连接（需要 API Key）<br>
+                <br>
+                鉴权方式：Authorization: Bearer &lt;your-api-key&gt;
             </p>
         </div>
     </body>
@@ -156,12 +205,31 @@ async def screenshot():
 
 
 # ============================================================
+# OpenAI 兼容端点：列出模型（需要鉴权）
+# ============================================================
+@app.get("/v1/models")
+async def list_models(request: Request):
+    """列出可用模型，兼容 OpenAI API 格式。"""
+    verify_api_key(request)
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "deepseek-chat",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "deepseek-proxy",
+            }
+        ],
+    }
+
+
+# ============================================================
 # 辅助函数：将 messages 数组拼接为完整的上下文字符串
 # ============================================================
 def build_prompt_from_messages(messages: list) -> str:
     """
     将 OpenAI 格式的 messages 数组拼接为单个 prompt 字符串。
-    与本地 deepseek_proxy.py 的逻辑完全一致。
     """
     prompt_parts = []
     prompt_parts.append("请根据以下对话历史和最后一个用户对话，生成对应的回复。")
@@ -170,7 +238,6 @@ def build_prompt_from_messages(messages: list) -> str:
         role = message.get("role", "")
         content = message.get("content", "")
 
-        # 处理 content 可能是字符串或列表（多模态）的情况
         processed_content = ""
         if isinstance(content, str):
             processed_content = content
@@ -186,14 +253,16 @@ def build_prompt_from_messages(messages: list) -> str:
 
 
 # ============================================================
-# 核心 API：兼容 OpenAI 格式的聊天接口
+# 核心 API：兼容 OpenAI 格式的聊天接口（需要鉴权）
 # ============================================================
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """
-    兼容 OpenAI API 格式的聊天端点。
-    接收标准的 messages 数组，将完整上下文拼接后通过浏览器发送给 DeepSeek。
+    兼容 OpenAI API 格式的聊天端点。需要 API Key 鉴权。
     """
+    # 鉴权
+    verify_api_key(request)
+
     if not browser_mgr or not await browser_mgr.is_alive():
         raise HTTPException(status_code=503, detail="浏览器会话未就绪")
 
@@ -208,7 +277,6 @@ async def chat_completions(request: Request):
 
     stream = body.get("stream", False)
 
-    # ====== 关键改动：将完整 messages 拼接为带上下文的 prompt ======
     user_prompt = build_prompt_from_messages(messages)
 
     if not user_prompt:
@@ -232,7 +300,6 @@ async def chat_completions(request: Request):
                 }
                 yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-            # 发送结束标记
             end_data = {
                 "id": f"chatcmpl-{int(time.time()*1000)}",
                 "object": "chat.completion.chunk",
@@ -269,12 +336,49 @@ async def chat_completions(request: Request):
 
 
 # ============================================================
-# WebSocket 端点
+# WebSocket 端点（需要鉴权）
 # ============================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket 连接。鉴权方式：
+    1. 查询参数: ws://host/ws?api_key=<key>
+    2. 首条消息: {"type": "auth", "api_key": "<key>"}
+    """
     await websocket.accept()
     print(f"📡 WebSocket 客户端已连接: {websocket.client}")
+
+    # 检查查询参数中的 api_key
+    api_key_param = websocket.query_params.get("api_key", "").strip()
+    authenticated = (api_key_param == API_SECRET_KEY)
+
+    if not authenticated:
+        # 等待首条消息进行鉴权
+        try:
+            first_msg = await asyncio.wait_for(websocket.receive_text(), timeout=10)
+            try:
+                payload = json.loads(first_msg)
+                if payload.get("type") == "auth" and payload.get("api_key") == API_SECRET_KEY:
+                    authenticated = True
+                    await websocket.send_json({"type": "auth", "status": "ok"})
+                else:
+                    # 不是 auth 消息，也检查一下 api_key
+                    if payload.get("api_key") == API_SECRET_KEY:
+                        authenticated = True
+                        await websocket.send_json({"type": "auth", "status": "ok"})
+            except json.JSONDecodeError:
+                pass
+        except asyncio.TimeoutError:
+            pass
+
+    if not authenticated:
+        await websocket.send_json({
+            "type": "error",
+            "error": "Authentication required. Send {\"type\":\"auth\",\"api_key\":\"<key>\"} "
+                     "or connect with ?api_key=<key>"
+        })
+        await websocket.close(code=4001, reason="Unauthorized")
+        return
 
     try:
         while True:
