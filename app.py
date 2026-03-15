@@ -27,26 +27,25 @@ keepalive_svc: KeepaliveService = None
 
 
 # ============================================================
-# FastAPI 生命周期管理
+# FastAPI 生命周期管理（修改：先启动服务器，再后台初始化浏览器）
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用启动时初始化浏览器，关闭时清理资源。"""
+    """应用启动时先让服务器就绪，再在后台初始化浏览器。"""
     global browser_mgr, keepalive_svc
 
     print(f"\n{'='*60}")
     print(f"  应用启动 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
 
-    # 初始化浏览器管理器
+    # 1. 先创建管理器实例，但不等待初始化完成
     browser_mgr = BrowserManager()
-    await browser_mgr.initialize()
-
-    # 初始化保活服务
     keepalive_svc = KeepaliveService(browser_mgr)
-    await keepalive_svc.start()
 
-    print("🚀 服务已就绪，等待请求...\n")
+    # 2. 启动一个后台任务来初始化浏览器（不等待）
+    asyncio.create_task(initialize_background())
+
+    print("🚀 服务已就绪（浏览器后台初始化中），等待请求...\n")
     yield
 
     # 关闭时清理
@@ -58,11 +57,27 @@ async def lifespan(app: FastAPI):
     print("✅ 服务已安全关闭。")
 
 
+async def initialize_background():
+    """后台初始化浏览器，完成后启动心跳服务。"""
+    global browser_mgr, keepalive_svc
+    print("⏳ 后台任务：开始初始化浏览器...")
+    try:
+        await browser_mgr.initialize()
+        print("✅ 后台任务：浏览器初始化完成。")
+
+        # 浏览器初始化完成后，再启动保活服务（防止在浏览器未就绪时误操作）
+        if keepalive_svc and not keepalive_svc.is_running:
+            await keepalive_svc.start()
+    except Exception as e:
+        print(f"❌ 后台任务：浏览器初始化失败: {e}")
+        # 即使失败，服务依然存活，可通过 /screenshot 等端点查看状态
+
+
 app = FastAPI(title="DeepSeek Proxy", lifespan=lifespan)
 
 
 # ============================================================
-# 健康检查 & 状态页
+# 健康检查 & 状态页（保持不变）
 # ============================================================
 @app.get("/")
 async def index():
@@ -148,7 +163,7 @@ async def screenshot():
 
 
 # ============================================================
-# 核心 API：兼容 OpenAI 格式的聊天接口
+# 核心 API：兼容 OpenAI 格式的聊天接口（保持不变）
 # ============================================================
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -217,7 +232,7 @@ async def chat_completions(request: Request):
 
 
 # ============================================================
-# WebSocket 端点：实时双向通信
+# WebSocket 端点：实时双向通信（保持不变）
 # ============================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
