@@ -22,7 +22,7 @@ CENSORSHIP_PHRASES = [
     "这个话题不太适合讨论",
     "我没法对此进行回答",
     "作为AI助手，我无法",
-    "你好，这个问题我暂时无法回答，让我们换个话题再聊聊吧"
+    "你好，这个问题我暂时无法回答，让我们换个话题再聊聊吧",
     "很抱歉，这个问题",
 ]
 
@@ -67,6 +67,19 @@ class ChatPage:
         )
         await asyncio.sleep(3)
 
+    async def get_conversation_item_count(self) -> int:
+        """获取当前对话项数量"""
+        try:
+            return await self.page.evaluate("""
+                () => {
+                    return document.querySelectorAll(
+                        'div[data-virtual-list-item-key]'
+                    ).length;
+                }
+            """)
+        except Exception:
+            return 0
+
     async def type_and_send(self, message: str):
         textarea = self.page.locator(
             "textarea[placeholder*='DeepSeek'], "
@@ -106,13 +119,6 @@ class ChatPage:
         await asyncio.sleep(1)
 
     async def read_response_text(self) -> str:
-        """
-        精确读取正式回复区域的文本，排除思考区域。
-        策略：
-        1. 找到最后一个对话项
-        2. 排除思考折叠区域（通常有特定类名包裹）
-        3. 取正式回复的 ds-markdown 的 innerText（保留换行格式）
-        """
         try:
             text = await self.page.evaluate("""
                 () => {
@@ -122,13 +128,9 @@ class ChatPage:
                     if (items.length === 0) return '';
                     const lastItem = items[items.length - 1];
 
-                    // 尝试获取所有 ds-markdown 元素
                     const allMd = lastItem.querySelectorAll('[class*="ds-markdown"]');
                     if (allMd.length === 0) return '';
 
-                    // 策略：排除在思考区域内的 ds-markdown
-                    // 思考区域通常被一个带有特定类名的容器包裹
-                    // 常见的思考区域容器类名模式
                     const thinkContainerSelectors = [
                         '[class*="think"]',
                         '[class*="Think"]',
@@ -140,14 +142,12 @@ class ChatPage:
                         'details',
                     ];
 
-                    // 找到思考区域的容器们
                     const thinkContainers = [];
                     for (const sel of thinkContainerSelectors) {
                         const els = lastItem.querySelectorAll(sel);
                         els.forEach(el => thinkContainers.push(el));
                     }
 
-                    // 过滤：找到不在任何思考容器内部的 ds-markdown
                     const replyMds = [];
                     for (const md of allMd) {
                         let insideThink = false;
@@ -162,17 +162,10 @@ class ChatPage:
                         }
                     }
 
-                    // 如果过滤后没有结果，可能思考区域选择器没匹配上
-                    // 回退：取最后一个 ds-markdown（通常正式回复在思考之后）
                     if (replyMds.length === 0) {
-                        // 回退策略：在 lastItem 的直接子层级找
-                        // 通常结构是: lastItem > [思考区域] > [正式回复区域(含ds-markdown)]
-                        // 取最后一个顶层 ds-markdown
                         return allMd[allMd.length - 1].innerText || '';
                     }
 
-                    // 取最后一个非思考区域的 ds-markdown
-                    // 用 innerText 而非 textContent，保留可读格式
                     return replyMds[replyMds.length - 1].innerText || '';
                 }
             """)
@@ -181,10 +174,6 @@ class ChatPage:
             return ""
 
     async def check_generation_state(self) -> dict:
-        """
-        检查生成状态：是否正在生成、是否有复制按钮、文本内容。
-        一次 evaluate 完成所有检查。
-        """
         return await self.page.evaluate("""
             () => {
                 const items = document.querySelectorAll(
@@ -201,7 +190,6 @@ class ChatPage:
 
                 const lastItem = items[items.length - 1];
 
-                // ---- 读取正式回复文本（排除思考区域）----
                 const allMd = lastItem.querySelectorAll('[class*="ds-markdown"]');
                 let text = '';
 
@@ -244,13 +232,11 @@ class ChatPage:
                     }
                 }
 
-                // ---- 复制按钮 ----
                 const buttons = lastItem.querySelectorAll(
                     'div[role="button"]'
                 );
                 const hasButton = buttons.length > 0;
 
-                // ---- 正在生成 ----
                 const stopBtn = document.querySelector(
                     '[class*="stop"], [class*="square"]'
                 );
@@ -283,7 +269,6 @@ def _is_censored(text: str) -> bool:
         return False
     for phrase in CENSORSHIP_PHRASES:
         if phrase in text:
-            # 如果整个文本很短且包含审查短语，很可能是被替换了
             if len(text) < 100:
                 return True
     return False
@@ -531,26 +516,35 @@ class BrowserManager:
                     yield f"[错误] 页面恢复失败: {e}"
                     return
 
+            # ========== 新对话 & 记录基线 ==========
             await cp.start_new_chat()
             await asyncio.sleep(1)
+
+            # 记录发送前的对话项数量，用于判断新回复是否出现
+            baseline_item_count = await cp.get_conversation_item_count()
+            print(f"  [{req_id}] 基线对话项数: {baseline_item_count}")
+
             await cp.type_and_send(message)
             print(f"  [{req_id}] 等待回复...")
 
             # ═══════════════════════════════════════════════════
-            # 核心逻辑重写：
-            # 1. 流式轮询，持续读取文本并输出增量
-            # 2. 每次都保存快照，检测到审查替换时使用上次快照
-            # 3. 复制按钮出现后立刻结束
+            # 核心逻辑：
+            # 1. 先等新的对话项出现（排除残留状态的干扰）
+            # 2. 流式轮询，持续读取文本并输出增量
+            # 3. 每次都保存快照，检测到审查替换时使用上次快照
+            # 4. 复制按钮出现后结束
             # ═══════════════════════════════════════════════════
 
             max_wait_seconds = 600
-            poll_interval = 0.3  # 轮询间隔，越小越快能抢到内容
+            poll_interval = 0.3
 
-            last_text = ""          # 上一次读到的完整文本
-            best_snapshot = ""      # 最佳快照（最长的有效文本）
-            yielded_length = 0      # 已经 yield 出去的字符数
+            last_text = ""
+            best_snapshot = ""
+            yielded_length = 0
             generation_started = False
-            idle_ticks = 0          # 没有新增文本的连续次数
+            new_response_appeared = False  # 新回复对话项是否已出现
+            idle_ticks = 0
+            btn_with_text_ticks = 0  # 有按钮+有文本+非生成中 的连续次数
             finished = False
 
             for tick in range(int(max_wait_seconds / poll_interval)):
@@ -566,20 +560,52 @@ class BrowserManager:
                 current_text = (state.get("text") or "").strip()
                 item_count = state.get("itemCount", 0)
 
-                # 跟踪生成是否开始
+                # ---- 等待新回复出现 ----
+                # 发送消息后，对话项数量应该增加（用户消息+助手回复）
+                if not new_response_appeared:
+                    if item_count > baseline_item_count:
+                        new_response_appeared = True
+                        print(f"  [{req_id}] 📬 新对话项出现 "
+                              f"({baseline_item_count} -> {item_count})")
+                        # 重置：新回复出现后，之前的按钮状态都不算
+                        has_button = False
+                    elif is_generating:
+                        # 即使 item_count 没变，如果检测到生成中也认为开始了
+                        new_response_appeared = True
+                        print(f"  [{req_id}] 📬 检测到生成开始")
+                    else:
+                        # 新回复还没出现，忽略当前状态（可能是上一轮残留）
+                        elapsed = tick * poll_interval
+                        if tick > 0 and tick % int(20 / poll_interval) == 0:
+                            print(f"  [{req_id}] ⏳ {elapsed:.0f}s "
+                                  f"等待新回复... items={item_count} "
+                                  f"baseline={baseline_item_count}")
+                        # 如果等了很久还没出现新对话项，可能消息没发出去
+                        if tick * poll_interval > 30 and not is_generating:
+                            print(f"  [{req_id}] ⚠️ 30秒未见新对话项，"
+                                  f"尝试重新发送")
+                            try:
+                                await cp.type_and_send(message)
+                                baseline_item_count = item_count
+                            except Exception as e:
+                                print(f"  [{req_id}] ❌ 重发失败: {e}")
+                        if tick * poll_interval > 60:
+                            print(f"  [{req_id}] ❌ 60秒无新对话项，放弃")
+                            break
+                        continue
+
+                # ---- 跟踪生成是否开始 ----
                 if is_generating and not generation_started:
                     generation_started = True
                     print(f"  [{req_id}] 🚀 生成开始")
 
                 # ---- 审查检测 ----
-                # 如果之前积累了较长文本，突然变短且包含审查短语
                 if (current_text and
                     len(best_snapshot) > 50 and
                     len(current_text) < len(best_snapshot) * 0.5 and
                     _is_censored(current_text)):
                     print(f"  [{req_id}] 🛡️ 检测到审查替换！"
                           f"当前={len(current_text)} vs 快照={len(best_snapshot)}")
-                    # 使用最佳快照，补发未 yield 的部分
                     remaining = best_snapshot[yielded_length:]
                     if remaining:
                         yield remaining
@@ -588,53 +614,66 @@ class BrowserManager:
                     finished = True
                     break
 
-                # 如果当前文本就是审查提示语（从一开始就被替换了）
-                # 且没有积累过更长的文本
-                if (current_text and
-                    not is_generating and
-                    has_button and
-                    _is_censored(current_text) and
-                    len(best_snapshot) <= len(current_text)):
-                    # 没有更好的快照，只能返回审查后的文本
-                    # 但也先等一下看有没有机会
-                    pass
-
                 # ---- 更新快照 ----
                 if current_text and len(current_text) >= len(best_snapshot):
                     best_snapshot = current_text
 
                 # ---- 流式输出增量 ----
                 if current_text and len(current_text) > yielded_length:
-                    # 只有在生成中才做流式输出，避免输出审查内容
                     if is_generating or (not has_button and generation_started):
                         new_content = current_text[yielded_length:]
                         yield new_content
                         yielded_length = len(current_text)
                         last_text = current_text
                         idle_ticks = 0
+                        btn_with_text_ticks = 0
 
-                # ---- 完成检测 ----
-                if has_button and not is_generating and generation_started:
-                    # 复制按钮出现，生成结束
-                    # 先检查是否被审查替换
-                    if (_is_censored(current_text) and
-                        len(best_snapshot) > len(current_text) * 1.5):
-                        # 被替换了，用快照
-                        remaining = best_snapshot[yielded_length:]
-                        if remaining:
-                            yield remaining
-                        print(f"  [{req_id}] 🛡️ 完成时检测到审查，"
-                              f"使用快照 {len(best_snapshot)} 字符")
+                # ---- 完成检测（主逻辑）----
+                if has_button and not is_generating:
+                    if generation_started:
+                        # 经典路径：生成曾开始，现已停止，有按钮
+                        if (_is_censored(current_text) and
+                            len(best_snapshot) > len(current_text) * 1.5):
+                            remaining = best_snapshot[yielded_length:]
+                            if remaining:
+                                yield remaining
+                            print(f"  [{req_id}] 🛡️ 完成时检测到审查，"
+                                  f"使用快照 {len(best_snapshot)} 字符")
+                        else:
+                            if current_text and len(current_text) > yielded_length:
+                                remaining = current_text[yielded_length:]
+                                yield remaining
+                                yielded_length = len(current_text)
+                            print(f"  [{req_id}] ✅ 正常完成 "
+                                  f"{max(yielded_length, len(current_text))} 字符")
+                        finished = True
+                        break
+                    elif new_response_appeared and current_text:
+                        # 新路径：新回复已出现，有文本，有按钮，但从未检测到
+                        # isGenerating（可能生成太快，错过了生成状态窗口）
+                        btn_with_text_ticks += 1
+                        # 等几个 tick 确认文本稳定不变
+                        if btn_with_text_ticks >= int(3.0 / poll_interval):
+                            if (_is_censored(current_text) and
+                                len(best_snapshot) > len(current_text) * 1.5):
+                                remaining = best_snapshot[yielded_length:]
+                                if remaining:
+                                    yield remaining
+                                print(f"  [{req_id}] 🛡️ 快速完成检测到审查，"
+                                      f"使用快照 {len(best_snapshot)} 字符")
+                            else:
+                                if current_text and len(current_text) > yielded_length:
+                                    remaining = current_text[yielded_length:]
+                                    yield remaining
+                                    yielded_length = len(current_text)
+                                print(f"  [{req_id}] ✅ 快速完成（未捕获生成状态）"
+                                      f" {max(yielded_length, len(current_text))} 字符")
+                            finished = True
+                            break
                     else:
-                        # 正常完成，补发剩余
-                        if current_text and len(current_text) > yielded_length:
-                            remaining = current_text[yielded_length:]
-                            yield remaining
-                            yielded_length = len(current_text)
-                        print(f"  [{req_id}] ✅ 正常完成 "
-                              f"{max(yielded_length, len(current_text))} 字符")
-                    finished = True
-                    break
+                        btn_with_text_ticks = 0
+                else:
+                    btn_with_text_ticks = 0
 
                 # ---- 文本不变计数 ----
                 if current_text == last_text:
@@ -651,19 +690,23 @@ class BrowserManager:
                         f"len={len(current_text)} "
                         f"gen={is_generating} "
                         f"btn={has_button} "
-                        f"snapshot={len(best_snapshot)}"
+                        f"snapshot={len(best_snapshot)} "
+                        f"started={generation_started} "
+                        f"newResp={new_response_appeared}"
                     )
 
                 # ---- 超时检测 ----
-                if tick * poll_interval > 60 and not generation_started and not current_text:
-                    print(f"  [{req_id}] ❌ 60秒无回复")
+                if (tick * poll_interval > 60 and
+                    not generation_started and
+                    not current_text and
+                    new_response_appeared):
+                    print(f"  [{req_id}] ❌ 60秒无回复内容")
                     break
 
-                # 如果已经很久没有新内容且不在生成中
+                # 长时间无新内容且不在生成中
                 if (idle_ticks > int(30 / poll_interval) and
                     not is_generating and
-                    generation_started):
-                    # 可能生成已结束但没检测到按钮
+                    (generation_started or new_response_appeared)):
                     if current_text:
                         remaining = current_text[yielded_length:]
                         if remaining:
@@ -682,7 +725,6 @@ class BrowserManager:
                     print(f"  [{req_id}] 📋 兜底快照: "
                           f"{len(best_snapshot)} 字符")
                 elif yielded_length == 0:
-                    # 完全没输出过内容
                     fallback = await cp.read_response_text()
                     if fallback:
                         yield fallback
