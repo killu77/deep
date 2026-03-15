@@ -1,3 +1,4 @@
+# app.py
 """
 主服务器：FastAPI + WebSocket 代理
 外部请求通过 HTTP/WebSocket 进入，由内部浏览器在已认证的上下文中执行。
@@ -39,19 +40,16 @@ def verify_api_key(request: Request):
     2. X-API-Key: <key>
     3. 查询参数 ?api_key=<key>
     """
-    # 方式1: Authorization Bearer
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:].strip()
         if token == API_SECRET_KEY:
             return True
 
-    # 方式2: X-API-Key header
     x_api_key = request.headers.get("x-api-key", "").strip()
     if x_api_key == API_SECRET_KEY:
         return True
 
-    # 方式3: 查询参数
     api_key_param = request.query_params.get("api_key", "").strip()
     if api_key_param == API_SECRET_KEY:
         return True
@@ -68,6 +66,24 @@ def verify_api_key(request: Request):
             }
         },
     )
+
+
+# ============================================================
+# 等待浏览器就绪的辅助函数
+# ============================================================
+async def ensure_browser_ready():
+    """确保浏览器已初始化完成。初始化期间阻塞等待，超时返回503。"""
+    if browser_mgr is None:
+        raise HTTPException(status_code=503, detail="服务正在启动中，请稍后重试")
+
+    if not browser_mgr.is_ready:
+        print("  ⏳ 请求到达，等待浏览器初始化完成...")
+        ok = await browser_mgr.wait_until_ready(timeout=180)
+        if not ok:
+            raise HTTPException(status_code=503, detail="浏览器初始化超时，请稍后重试")
+
+    if not await browser_mgr.is_alive():
+        raise HTTPException(status_code=503, detail="浏览器会话已断开")
 
 
 # ============================================================
@@ -127,11 +143,25 @@ async def index():
     hours, remainder = divmod(int(uptime), 3600)
     minutes, seconds = divmod(remainder, 60)
 
+    ready = status.get("ready", False)
+    alive = status.get("browser_alive", False)
+
+    if ready and alive:
+        status_text = "运行中"
+        dot_color = "#3fb950"
+    elif not ready:
+        status_text = "初始化中..."
+        dot_color = "#f0ad4e"
+    else:
+        status_text = "离线"
+        dot_color = "#f85149"
+
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <title>DeepSeek Proxy</title>
+        <meta http-equiv="refresh" content="10">
         <style>
             body {{ font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; 
                    display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
@@ -139,8 +169,7 @@ async def index():
                      padding: 40px; max-width: 500px; width: 90%; }}
             h1 {{ color: #58a6ff; margin-top: 0; }}
             .status {{ display: flex; align-items: center; gap: 10px; margin: 20px 0; }}
-            .dot {{ width: 12px; height: 12px; border-radius: 50%; 
-                    background: {"#3fb950" if status.get("browser_alive") else "#f85149"}; }}
+            .dot {{ width: 12px; height: 12px; border-radius: 50%; background: {dot_color}; }}
             .info {{ background: #21262d; padding: 15px; border-radius: 8px; margin: 10px 0; 
                      font-family: monospace; font-size: 14px; }}
             .label {{ color: #8b949e; }}
@@ -151,12 +180,14 @@ async def index():
             <h1>🤖 DeepSeek Proxy</h1>
             <div class="status">
                 <div class="dot"></div>
-                <span>{"运行中" if status.get("browser_alive") else "离线"}</span>
+                <span>{status_text}</span>
             </div>
             <div class="info">
                 <div><span class="label">运行时间：</span>{hours}h {minutes}m {seconds}s</div>
+                <div><span class="label">就绪状态：</span>{"✅ 就绪" if ready else "⏳ 初始化中"}</div>
                 <div><span class="label">登录状态：</span>{"✅ 已登录" if status.get("logged_in") else "❌ 未登录"}</div>
                 <div><span class="label">引擎：</span>{status.get("engine", "N/A")}</div>
+                <div><span class="label">Token：</span>{"✅ 有" if status.get("has_token") else "❌ 无"}</div>
                 <div><span class="label">心跳次数：</span>{status.get("heartbeat_count", 0)}</div>
                 <div><span class="label">处理请求：</span>{status.get("requests_handled", 0)}</div>
                 <div><span class="label">API鉴权：</span>✅ 已启用</div>
@@ -176,8 +207,10 @@ async def index():
 
 @app.get("/health")
 async def health():
-    """健康检查端点：只要服务进程活着就返回200，不依赖浏览器状态。"""
-    return {"status": "ok"}
+    """健康检查端点。"""
+    if browser_mgr and browser_mgr.is_ready:
+        return {"status": "ok", "ready": True}
+    return {"status": "initializing", "ready": False}
 
 
 @app.get("/status")
@@ -228,9 +261,7 @@ async def list_models(request: Request):
 # 辅助函数：将 messages 数组拼接为完整的上下文字符串
 # ============================================================
 def build_prompt_from_messages(messages: list) -> str:
-    """
-    将 OpenAI 格式的 messages 数组拼接为单个 prompt 字符串。
-    """
+    """将 OpenAI 格式的 messages 数组拼接为单个 prompt 字符串。"""
     prompt_parts = []
     prompt_parts.append("请根据以下对话历史和最后一个用户对话，生成对应的回复。")
 
@@ -257,14 +288,12 @@ def build_prompt_from_messages(messages: list) -> str:
 # ============================================================
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """
-    兼容 OpenAI API 格式的聊天端点。需要 API Key 鉴权。
-    """
+    """兼容 OpenAI API 格式的聊天端点。需要 API Key 鉴权。"""
     # 鉴权
     verify_api_key(request)
 
-    if not browser_mgr or not await browser_mgr.is_alive():
-        raise HTTPException(status_code=503, detail="浏览器会话未就绪")
+    # ★ 关键改动：等待浏览器就绪，不再直接 503
+    await ensure_browser_ready()
 
     try:
         body = await request.json()
@@ -340,20 +369,14 @@ async def chat_completions(request: Request):
 # ============================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket 连接。鉴权方式：
-    1. 查询参数: ws://host/ws?api_key=<key>
-    2. 首条消息: {"type": "auth", "api_key": "<key>"}
-    """
+    """WebSocket 连接。"""
     await websocket.accept()
     print(f"📡 WebSocket 客户端已连接: {websocket.client}")
 
-    # 检查查询参数中的 api_key
     api_key_param = websocket.query_params.get("api_key", "").strip()
     authenticated = (api_key_param == API_SECRET_KEY)
 
     if not authenticated:
-        # 等待首条消息进行鉴权
         try:
             first_msg = await asyncio.wait_for(websocket.receive_text(), timeout=10)
             try:
@@ -361,11 +384,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 if payload.get("type") == "auth" and payload.get("api_key") == API_SECRET_KEY:
                     authenticated = True
                     await websocket.send_json({"type": "auth", "status": "ok"})
-                else:
-                    # 不是 auth 消息，也检查一下 api_key
-                    if payload.get("api_key") == API_SECRET_KEY:
-                        authenticated = True
-                        await websocket.send_json({"type": "auth", "status": "ok"})
+                elif payload.get("api_key") == API_SECRET_KEY:
+                    authenticated = True
+                    await websocket.send_json({"type": "auth", "status": "ok"})
             except json.JSONDecodeError:
                 pass
         except asyncio.TimeoutError:
@@ -393,8 +414,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"error": "消息不能为空"})
                 continue
 
-            if not browser_mgr or not await browser_mgr.is_alive():
-                await websocket.send_json({"error": "浏览器会话未就绪"})
+            # WebSocket 也等待就绪
+            if not browser_mgr or not browser_mgr.is_ready:
+                await websocket.send_json({"type": "info", "message": "浏览器初始化中，请稍候..."})
+                ok = await browser_mgr.wait_until_ready(timeout=180) if browser_mgr else False
+                if not ok:
+                    await websocket.send_json({"error": "浏览器初始化超时"})
+                    continue
+
+            if not await browser_mgr.is_alive():
+                await websocket.send_json({"error": "浏览器会话已断开"})
                 continue
 
             await websocket.send_json({"type": "start"})
