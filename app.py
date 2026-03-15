@@ -27,7 +27,7 @@ keepalive_svc: KeepaliveService = None
 
 
 # ============================================================
-# FastAPI 生命周期管理（修改：先启动服务器，再后台初始化浏览器）
+# FastAPI 生命周期管理
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,17 +38,14 @@ async def lifespan(app: FastAPI):
     print(f"  应用启动 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
 
-    # 1. 先创建管理器实例，但不等待初始化完成
     browser_mgr = BrowserManager()
     keepalive_svc = KeepaliveService(browser_mgr)
 
-    # 2. 启动一个后台任务来初始化浏览器（不等待）
     asyncio.create_task(initialize_background())
 
     print("🚀 服务已就绪（浏览器后台初始化中），等待请求...\n")
     yield
 
-    # 关闭时清理
     print("\n⏹️  正在关闭服务...")
     if keepalive_svc:
         await keepalive_svc.stop()
@@ -65,19 +62,17 @@ async def initialize_background():
         await browser_mgr.initialize()
         print("✅ 后台任务：浏览器初始化完成。")
 
-        # 浏览器初始化完成后，再启动保活服务（防止在浏览器未就绪时误操作）
         if keepalive_svc and not keepalive_svc.is_running:
             await keepalive_svc.start()
     except Exception as e:
         print(f"❌ 后台任务：浏览器初始化失败: {e}")
-        # 即使失败，服务依然存活，可通过 /screenshot 等端点查看状态
 
 
 app = FastAPI(title="DeepSeek Proxy", lifespan=lifespan)
 
 
 # ============================================================
-# 健康检查 & 状态页（保持不变）
+# 健康检查 & 状态页
 # ============================================================
 @app.get("/")
 async def index():
@@ -132,10 +127,8 @@ async def index():
 
 @app.get("/health")
 async def health():
-    """健康检查端点。"""
-    if browser_mgr and await browser_mgr.is_alive():
-        return {"status": "healthy", "browser": "alive"}
-    return JSONResponse(status_code=503, content={"status": "unhealthy", "browser": "dead"})
+    """健康检查端点：只要服务进程活着就返回200，不依赖浏览器状态。"""
+    return {"status": "ok"}
 
 
 @app.get("/status")
@@ -163,13 +156,43 @@ async def screenshot():
 
 
 # ============================================================
-# 核心 API：兼容 OpenAI 格式的聊天接口（保持不变）
+# 辅助函数：将 messages 数组拼接为完整的上下文字符串
+# ============================================================
+def build_prompt_from_messages(messages: list) -> str:
+    """
+    将 OpenAI 格式的 messages 数组拼接为单个 prompt 字符串。
+    与本地 deepseek_proxy.py 的逻辑完全一致。
+    """
+    prompt_parts = []
+    prompt_parts.append("请根据以下对话历史和最后一个用户对话，生成对应的回复。")
+
+    for message in messages:
+        role = message.get("role", "")
+        content = message.get("content", "")
+
+        # 处理 content 可能是字符串或列表（多模态）的情况
+        processed_content = ""
+        if isinstance(content, str):
+            processed_content = content
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    processed_content += part.get("text", "")
+
+        if role and processed_content:
+            prompt_parts.append(f"角色: {role}\n内容: {processed_content}")
+
+    return "\n\n---\n\n".join(prompt_parts)
+
+
+# ============================================================
+# 核心 API：兼容 OpenAI 格式的聊天接口
 # ============================================================
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """
     兼容 OpenAI API 格式的聊天端点。
-    接收标准的 messages 数组，通过浏览器发送给 DeepSeek，返回响应。
+    接收标准的 messages 数组，将完整上下文拼接后通过浏览器发送给 DeepSeek。
     """
     if not browser_mgr or not await browser_mgr.is_alive():
         raise HTTPException(status_code=503, detail="浏览器会话未就绪")
@@ -185,20 +208,17 @@ async def chat_completions(request: Request):
 
     stream = body.get("stream", False)
 
-    # 提取最后一条用户消息
-    user_message = ""
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            user_message = msg.get("content", "")
-            break
+    # ====== 关键改动：将完整 messages 拼接为带上下文的 prompt ======
+    user_prompt = build_prompt_from_messages(messages)
 
-    if not user_message:
-        raise HTTPException(status_code=400, detail="未找到用户消息")
+    if not user_prompt:
+        raise HTTPException(status_code=400, detail="未找到有效的用户输入")
+
+    print(f"📝 构建的 prompt 长度: {len(user_prompt)} 字符")
 
     if stream:
-        # 流式响应
         async def generate():
-            async for chunk in browser_mgr.send_message_stream(user_message):
+            async for chunk in browser_mgr.send_message_stream(user_prompt):
                 data = {
                     "id": f"chatcmpl-{int(time.time()*1000)}",
                     "object": "chat.completion.chunk",
@@ -211,12 +231,25 @@ async def chat_completions(request: Request):
                     }]
                 }
                 yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+            # 发送结束标记
+            end_data = {
+                "id": f"chatcmpl-{int(time.time()*1000)}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "deepseek-chat",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }
+            yield f"data: {json.dumps(end_data, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(generate(), media_type="text/event-stream")
     else:
-        # 非流式响应
-        response_text = await browser_mgr.send_message(user_message)
+        response_text = await browser_mgr.send_message(user_prompt)
         return {
             "id": f"chatcmpl-{int(time.time()*1000)}",
             "object": "chat.completion",
@@ -227,20 +260,19 @@ async def chat_completions(request: Request):
                 "message": {"role": "assistant", "content": response_text},
                 "finish_reason": "stop"
             }],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            "usage": {
+                "prompt_tokens": len(user_prompt),
+                "completion_tokens": len(response_text),
+                "total_tokens": len(user_prompt) + len(response_text)
+            }
         }
 
 
 # ============================================================
-# WebSocket 端点：实时双向通信（保持不变）
+# WebSocket 端点
 # ============================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket 端点，支持实时对话。
-    客户端发送 JSON: {"message": "你好"}
-    服务端实时推送响应片段。
-    """
     await websocket.accept()
     print(f"📡 WebSocket 客户端已连接: {websocket.client}")
 
@@ -251,7 +283,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 payload = json.loads(data)
                 message = payload.get("message", "")
             except json.JSONDecodeError:
-                message = data  # 纯文本消息
+                message = data
 
             if not message:
                 await websocket.send_json({"error": "消息不能为空"})
@@ -261,7 +293,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"error": "浏览器会话未就绪"})
                 continue
 
-            # 流式转发响应
             await websocket.send_json({"type": "start"})
             full_response = ""
             async for chunk in browser_mgr.send_message_stream(message):
