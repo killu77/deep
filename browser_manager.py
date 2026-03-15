@@ -37,13 +37,28 @@ class BrowserManager:
         """初始化浏览器并完成登录。"""
         print("🔧 正在初始化 Camoufox 浏览器...")
 
+        # 先尝试使用 Camoufox
+        camoufox_succeeded = False
         try:
-            # 尝试使用 Camoufox
+            # 设置环境变量禁用 Camoufox 的更新检查（避免 GitHub API 限流）
+            os.environ['CAMOUFOX_NO_UPDATE_CHECK'] = '1'
             from camoufox.async_api import AsyncCamoufox
             self._camoufox_cls = AsyncCamoufox
             await self._start_with_camoufox()
-        except ImportError:
-            print("⚠️ Camoufox 未安装，回退到 Playwright Firefox...")
+            camoufox_succeeded = True
+        except Exception as e:
+            print(f"⚠️ Camoufox 启动失败: {e}")
+            print("⚠️ 将回退到 Playwright Firefox...")
+            # 清理可能的部分资源
+            if hasattr(self, '_camoufox'):
+                try:
+                    await self._camoufox.__aexit__(None, None, None)
+                except:
+                    pass
+            camoufox_succeeded = False
+
+        # 如果 Camoufox 失败，回退到 Playwright
+        if not camoufox_succeeded:
             await self._start_with_playwright()
 
         # 执行登录
