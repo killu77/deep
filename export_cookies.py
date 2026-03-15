@@ -1,9 +1,9 @@
-# export_cookies.py
+# export_cookies.py (修改版，输出单个环境变量 DEEPSEEK_AUTH)
 """
 本地 Cookie 导出工具：
 1. 启动一个真实的浏览器窗口（有界面）
 2. 你手动登录 DeepSeek
-3. 登录成功后自动导出 Cookie 到文件 / 打印为环境变量
+3. 登录成功后自动导出完整的认证数据并输出为单个环境变量
 """
 
 import asyncio
@@ -16,7 +16,7 @@ async def main():
     from playwright.async_api import async_playwright
 
     print("=" * 60)
-    print("  DeepSeek Cookie 导出工具")
+    print("  DeepSeek Cookie 导出工具 (单变量版)")
     print("=" * 60)
     print()
     print("即将打开浏览器，请在浏览器中手动完成以下操作：")
@@ -26,7 +26,6 @@ async def main():
     print()
 
     async with async_playwright() as p:
-        # 启动一个有界面的浏览器（非 headless）
         browser = await p.chromium.launch(
             headless=False,
             args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
@@ -43,18 +42,14 @@ async def main():
         )
         page = await context.new_page()
 
-        # 导航到 DeepSeek 登录页
         await page.goto("https://chat.deepseek.com/sign_in", wait_until="domcontentloaded")
         print("✅ 浏览器已打开，请手动登录...")
         print()
 
-        # 等待用户手动登录
-        # 方式1：等待 URL 变化（离开登录页）
         print("⏳ 正在等待你完成登录（URL 离开 sign_in 页面）...")
         print("   如果自动检测不到，登录完成后回到终端按 Enter 即可。")
         print()
 
-        # 同时监听：URL变化 或 用户按 Enter
         logged_in = False
         for i in range(600):  # 最多等 10 分钟
             await asyncio.sleep(1)
@@ -70,14 +65,12 @@ async def main():
         if not logged_in:
             input("\n请在浏览器中完成登录后，按 Enter 键继续...")
 
-        # 等待页面稳定
         await asyncio.sleep(3)
 
         # 导出 Cookie
         cookies = await context.cookies()
         print(f"\n📦 共获取到 {len(cookies)} 个 Cookie")
 
-        # 过滤出 deepseek 相关的 cookie
         ds_cookies = [c for c in cookies if "deepseek" in c.get("domain", "")]
         print(f"🎯 其中 DeepSeek 相关: {len(ds_cookies)} 个")
 
@@ -85,7 +78,7 @@ async def main():
             print("⚠️ 未找到 DeepSeek 的 Cookie，使用所有 Cookie")
             ds_cookies = cookies
 
-        # 同时获取 localStorage 中的 token（DeepSeek 可能把 token 存在这里）
+        # 获取 localStorage
         local_storage_data = await page.evaluate("""
             () => {
                 const data = {};
@@ -117,24 +110,22 @@ async def main():
             "url_after_login": page.url,
         }
 
-        # 保存到文件
-        output_file = Path("deepseek_cookies.json")
+        # 保存到文件（可选）
+        output_file = Path("deepseek_auth.json")
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(auth_data, f, ensure_ascii=False, indent=2)
-        print(f"\n✅ Cookie 已保存到: {output_file.absolute()}")
+        print(f"\n✅ 认证数据已保存到: {output_file.absolute()}")
 
-        # 同时生成环境变量格式（用于 HuggingFace Secrets）
-        cookies_json_str = json.dumps(ds_cookies, ensure_ascii=False)
-        storage_json_str = json.dumps(local_storage_data, ensure_ascii=False)
+        # ====== 修改点：输出单个环境变量 ======
+        auth_json_str = json.dumps(auth_data, ensure_ascii=False, separators=(',', ':'))
 
         print("\n" + "=" * 60)
-        print("  以下是环境变量格式，可直接粘贴到 HuggingFace Secrets")
+        print("  以下是单个环境变量格式，可直接粘贴到 HuggingFace Secrets")
         print("=" * 60)
-        print(f"\nDEEPSEEK_COOKIES={cookies_json_str}")
-        print(f"\nDEEPSEEK_LOCAL_STORAGE={storage_json_str}")
+        print(f"\nDEEPSEEK_AUTH={auth_json_str}")
         print("\n" + "=" * 60)
 
-        # 显示关键 Cookie 信息
+        # 可选：显示关键信息
         print("\n🔍 关键 Cookie 列表：")
         for c in ds_cookies:
             expires_info = ""
@@ -154,11 +145,10 @@ async def main():
                 print(f"  • {key}: {preview}...")
 
         await browser.close()
-        print("\n✅ 浏览器已关闭。Cookie 导出完成！")
+        print("\n✅ 浏览器已关闭。认证数据导出完成！")
 
 
 if __name__ == "__main__":
-    # 先确保安装了 playwright 和 chromium
     try:
         import playwright
     except ImportError:
