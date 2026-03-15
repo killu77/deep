@@ -1,479 +1,334 @@
-# browser_manager.py
+# app.py
 """
-浏览器生命周期管理器（修复版）：
-核心修复：
-1. Camoufox AsyncCamoufox 上下文管理器生命周期正确处理
-2. 增加启动超时保护
-3. 浏览器崩溃自动恢复
+主服务器：FastAPI + WebSocket 代理
+修复：端口统一、生命周期管理、错误处理
 """
 
 import os
 import sys
-import time
 import json
 import asyncio
-import base64
-from pathlib import Path
+import signal
+import time
 from datetime import datetime
-from typing import AsyncGenerator, Optional
+from contextlib import asynccontextmanager
 
-from auth_handler import AuthHandler
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
+import uvicorn
+
+from browser_manager import BrowserManager
+from keepalive import KeepaliveService
+
+# ============================================================
+# 全局实例
+# ============================================================
+browser_mgr: BrowserManager = None
+keepalive_svc: KeepaliveService = None
+_init_task = None
+
+# API 密钥验证
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "")
 
 
-class BrowserManager:
-    def __init__(self):
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
-        self.logged_in = False
-        self.start_time = time.time()
-        self.heartbeat_count = 0
-        self.requests_handled = 0
-        self._lock = asyncio.Lock()
-        self._camoufox_cm = None  # 保持上下文管理器引用，防止被 GC
+def verify_api_key(request: Request):
+    """验证 API 密钥（如果设置了 API_SECRET_KEY 环境变量）"""
+    if not API_SECRET_KEY:
+        return
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        if token == API_SECRET_KEY:
+            return
+    token = request.query_params.get("token", "")
+    if token == API_SECRET_KEY:
+        return
+    raise HTTPException(status_code=401, detail="Invalid API key")
 
-        self.email = os.getenv("DEEPSEEK_EMAIL", "")
-        self.password = os.getenv("DEEPSEEK_PASSWORD", "")
-        self.headless = os.getenv("HEADLESS", "true").lower() == "true"
-        self._engine = "unknown"
 
-    def _check_camoufox_installed(self) -> bool:
-        """检查 Camoufox 是否已预装"""
+# ============================================================
+# FastAPI 生命周期管理
+# ============================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用启动时先让服务器就绪，再在后台初始化浏览器。"""
+    global browser_mgr, keepalive_svc, _init_task
+
+    print(f"\n{'='*60}")
+    print(f"  应用启动 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}\n")
+
+    browser_mgr = BrowserManager()
+    keepalive_svc = KeepaliveService(browser_mgr)
+
+    # 后台初始化，不阻塞服务器启动
+    _init_task = asyncio.create_task(_safe_initialize())
+
+    print("🚀 服务已就绪（浏览器后台初始化中），等待请求...\n")
+    yield
+
+    # 关闭阶段
+    print("\n⏹️  正在关闭服务...")
+    if _init_task and not _init_task.done():
+        _init_task.cancel()
         try:
-            from camoufox.pkgman import get_path
-            path = get_path("camoufox")
-            if path and Path(path).exists():
-                print(f"  ✅ Camoufox 已预装: {path}")
-                return True
-        except Exception as e:
-            print(f"  ⚠️ 检查 Camoufox 路径时出错: {e}")
-
-        home_cache = Path.home() / ".cache" / "camoufox"
-        if home_cache.exists() and any(home_cache.iterdir()):
-            print(f"  ✅ 发现 Camoufox 缓存: {home_cache}")
-            return True
-
-        return False
-
-    async def initialize(self):
-        """初始化浏览器，带完整的错误处理和回退逻辑"""
-        print("🔧 正在初始化浏览器...")
-
-        os.environ['CAMOUFOX_NO_UPDATE_CHECK'] = '1'
-
-        # 尝试 Camoufox
-        camoufox_ok = False
-        if self._check_camoufox_installed():
-            print("  📦 使用预装的 Camoufox（跳过下载）")
-            try:
-                await asyncio.wait_for(self._start_with_camoufox(), timeout=60)
-                camoufox_ok = True
-                self._engine = "camoufox"
-                print("  ✅ Camoufox 启动成功")
-            except asyncio.TimeoutError:
-                print("  ⚠️ Camoufox 启动超时（60秒），回退到 Playwright")
-                await self._cleanup_camoufox()
-            except Exception as e:
-                print(f"  ⚠️ Camoufox 启动失败: {e}")
-                await self._cleanup_camoufox()
-
-        # 回退到 Playwright Firefox
-        if not camoufox_ok:
-            try:
-                await asyncio.wait_for(self._start_with_playwright(), timeout=60)
-                self._engine = "playwright-firefox"
-                print("  ✅ Playwright Firefox 启动成功")
-            except asyncio.TimeoutError:
-                raise RuntimeError("Playwright Firefox 启动超时（60秒）")
-            except Exception as e:
-                raise RuntimeError(f"Playwright Firefox 启动失败: {e}")
-
-        # 注入反检测脚本
-        await self._inject_stealth_scripts()
-
-        # Cookie 注入登录
-        auth = AuthHandler(self.page, context=self.context)
-        self.logged_in = await auth.login(self.email, self.password)
-
-        if self.logged_in:
-            print("🎉 登录成功！浏览器会话已建立。")
-        else:
-            print("⚠️ 登录可能未完成，请检查 /screenshot 端点。")
-
-    async def _cleanup_camoufox(self):
-        """安全清理 Camoufox 资源"""
-        try:
-            if self.page and not self.page.is_closed():
-                await self.page.close()
-        except Exception:
+            await _init_task
+        except asyncio.CancelledError:
             pass
-        try:
-            if self.context:
-                await self.context.close()
-        except Exception:
-            pass
-        try:
-            if self._camoufox_cm:
-                await self._camoufox_cm.__aexit__(None, None, None)
-        except Exception:
-            pass
-        self.page = None
-        self.context = None
-        self.browser = None
-        self._camoufox_cm = None
+    if keepalive_svc:
+        await keepalive_svc.stop()
+    if browser_mgr:
+        await browser_mgr.shutdown()
+    print("✅ 服务已安全关闭。")
 
-    async def _start_with_camoufox(self):
-        """使用 Camoufox 启动浏览器 —— 修复生命周期管理"""
-        print("  → 使用 Camoufox 反指纹浏览器...")
-        from camoufox.async_api import AsyncCamoufox
 
-        # 创建上下文管理器并保持引用
-        self._camoufox_cm = AsyncCamoufox(
-            headless=self.headless,
-            geoip=False,
-        )
+async def _safe_initialize():
+    """带错误保护的后台初始化"""
+    global browser_mgr, keepalive_svc
+    print("⏳ 后台任务：开始初始化浏览器...")
+    try:
+        # 给 Playwright 足够的启动时间（180秒）
+        await asyncio.wait_for(browser_mgr.initialize(), timeout=180)
+        print("✅ 后台任务：浏览器初始化完成。")
+        if keepalive_svc and not keepalive_svc.is_running:
+            await keepalive_svc.start()
+    except asyncio.TimeoutError:
+        print("❌ 后台任务：浏览器初始化超时（180秒）")
+    except Exception as e:
+        print(f"❌ 后台任务：浏览器初始化失败: {e}")
+        import traceback
+        traceback.print_exc()
 
-        # 进入上下文，获取 browser
-        self.browser = await self._camoufox_cm.__aenter__()
 
-        # 等一下让浏览器完全就绪
-        await asyncio.sleep(2)
 
-        # 检查浏览器是否真的活着
-        if not self.browser.is_connected():
-            raise RuntimeError("Camoufox browser 启动后立即断开连接")
+app = FastAPI(title="DeepSeek Proxy", lifespan=lifespan)
 
-        # 创建上下文和页面
-        try:
-            self.context = await self.browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                locale="zh-CN",
-                timezone_id="Asia/Shanghai",
-            )
-            await asyncio.sleep(1)
-            self.page = await self.context.new_page()
-        except Exception as e:
-            # 如果 new_context 或 new_page 失败，说明浏览器已经崩溃
-            raise RuntimeError(f"Camoufox 创建页面失败: {e}")
 
-        print("  ✅ Camoufox 浏览器已启动。")
+# ============================================================
+# 健康检查 & 状态页
+# ============================================================
+@app.api_route("/", methods=["GET", "HEAD"])
+async def index(request: Request):
+    if request.method == "HEAD":
+        return Response(status_code=200)
 
-    async def _start_with_playwright(self):
-        """使用 Playwright Firefox 启动浏览器"""
-        print("  → 回退到 Playwright Firefox...")
-        from playwright.async_api import async_playwright
+    status = await browser_mgr.get_status() if browser_mgr else {"status": "initializing"}
+    uptime = status.get("uptime_seconds", 0)
+    hours, remainder = divmod(int(uptime), 3600)
+    minutes, seconds = divmod(remainder, 60)
 
-        self.playwright = await async_playwright().start()
+    browser_alive = status.get("browser_alive", False)
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>DeepSeek Proxy</title>
+        <style>
+            body {{ font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; 
+                   display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
+            .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 12px; 
+                     padding: 40px; max-width: 500px; width: 90%; }}
+            h1 {{ color: #58a6ff; margin-top: 0; }}
+            .status {{ display: flex; align-items: center; gap: 10px; margin: 20px 0; }}
+            .dot {{ width: 12px; height: 12px; border-radius: 50%; 
+                    background: {"#3fb950" if browser_alive else "#f85149"}; }}
+            .info {{ background: #21262d; padding: 15px; border-radius: 8px; margin: 10px 0; 
+                     font-family: monospace; font-size: 14px; }}
+            .label {{ color: #8b949e; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>🤖 DeepSeek Proxy</h1>
+            <div class="status">
+                <div class="dot"></div>
+                <span>{"运行中" if browser_alive else "初始化中..."}</span>
+            </div>
+            <div class="info">
+                <div><span class="label">运行时间：</span>{hours}h {minutes}m {seconds}s</div>
+                <div><span class="label">登录状态：</span>{"✅ 已登录" if status.get("logged_in") else "❌ 未登录"}</div>
+                <div><span class="label">心跳次数：</span>{status.get("heartbeat_count", 0)}</div>
+                <div><span class="label">处理请求：</span>{status.get("requests_handled", 0)}</div>
+                <div><span class="label">引擎：</span>{status.get("engine", "N/A")}</div>
+            </div>
+            <p style="color: #8b949e; font-size: 12px;">
+                POST /v1/chat/completions 发送聊天请求<br>
+                WS /ws 建立 WebSocket 连接
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
 
-        try:
-            self.browser = await self.playwright.firefox.launch(
-                headless=self.headless,
-                args=["--no-sandbox"],
-            )
-        except Exception as launch_error:
-            print(f"  ⚠️ Firefox 启动失败: {launch_error}，尝试安装...")
-            import subprocess
-            result = subprocess.run(
-                [sys.executable, "-m", "playwright", "install", "firefox"],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"Playwright Firefox 安装失败: {result.stderr}")
-            self.browser = await self.playwright.firefox.launch(
-                headless=self.headless,
-                args=["--no-sandbox"],
-            )
 
-        self.context = await self.browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
-                "Gecko/20100101 Firefox/126.0"
-            ),
-        )
-        self.page = await self.context.new_page()
-        print("  ✅ Playwright Firefox 已启动。")
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def health(request: Request):
+    if request.method == "HEAD":
+        return Response(status_code=200)
+    return {"status": "ok"}
 
-    async def _inject_stealth_scripts(self):
-        """注入反检测脚本"""
-        if self._engine == "camoufox":
-            minimal_js = """
-            if (navigator.webdriver !== undefined) {
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+@app.get("/status")
+async def status():
+    if browser_mgr:
+        return await browser_mgr.get_status()
+    return {"status": "initializing"}
+
+
+@app.get("/screenshot")
+async def screenshot():
+    if not browser_mgr:
+        raise HTTPException(status_code=503, detail="浏览器未就绪")
+    img_base64 = await browser_mgr.take_screenshot_base64()
+    if img_base64:
+        html = f"""
+        <html><body style="background:#000;display:flex;justify-content:center;padding:20px;">
+        <img src="data:image/png;base64,{img_base64}" style="max-width:100%;border:1px solid #333;"/>
+        </body></html>
+        """
+        return HTMLResponse(content=html)
+    raise HTTPException(status_code=500, detail="截图失败")
+
+
+# ============================================================
+# 辅助函数
+# ============================================================
+def build_prompt_from_messages(messages: list) -> str:
+    prompt_parts = []
+    prompt_parts.append("请根据以下对话历史和最后一个用户对话，生成对应的回复。")
+    for message in messages:
+        role = message.get("role", "")
+        content = message.get("content", "")
+        processed_content = ""
+        if isinstance(content, str):
+            processed_content = content
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    processed_content += part.get("text", "")
+        if role and processed_content:
+            prompt_parts.append(f"角色: {role}\n内容: {processed_content}")
+    return "\n\n---\n\n".join(prompt_parts)
+
+
+# ============================================================
+# 核心 API：兼容 OpenAI 格式的聊天接口
+# ============================================================
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    verify_api_key(request)
+
+    if not browser_mgr or not await browser_mgr.is_alive():
+        raise HTTPException(status_code=503, detail="浏览器会话未就绪，请稍后重试")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="无效的 JSON 请求体")
+
+    messages = body.get("messages", [])
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages 不能为空")
+
+    stream = body.get("stream", False)
+    user_prompt = build_prompt_from_messages(messages)
+
+    if not user_prompt:
+        raise HTTPException(status_code=400, detail="未找到有效的用户输入")
+
+    print(f"📝 构建的 prompt 长度: {len(user_prompt)} 字符")
+
+    if stream:
+        async def generate():
+            async for chunk in browser_mgr.send_message_stream(user_prompt):
+                data = {
+                    "id": f"chatcmpl-{int(time.time()*1000)}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": "deepseek-chat",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": chunk},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+            end_data = {
+                "id": f"chatcmpl-{int(time.time()*1000)}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "deepseek-chat",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
             }
-            """
-            await self.context.add_init_script(minimal_js)
-            print("  🛡️ Camoufox 模式：使用最小化反检测脚本")
-        else:
-            firefox_stealth_js = """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'languages', { 
-                get: () => ['zh-CN', 'zh', 'en-US', 'en'] 
-            });
-            const originalQuery = window.navigator.permissions.query;
-            if (originalQuery) {
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({ state: Notification.permission }) :
-                        originalQuery(parameters)
-                );
-            }
-            """
-            await self.context.add_init_script(firefox_stealth_js)
-            print("  🛡️ Firefox 模式：注入兼容的反检测脚本")
-
-    async def is_alive(self) -> bool:
-        """检查浏览器是否存活"""
-        try:
-            if not self.page or self.page.is_closed():
-                return False
-            if not self.browser or not self.browser.is_connected():
-                return False
-            await self.page.evaluate("() => document.title")
-            return True
-        except Exception:
-            return False
-
-    async def get_status(self) -> dict:
-        alive = await self.is_alive()
+            yield f"data: {json.dumps(end_data, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(generate(), media_type="text/event-stream")
+    else:
+        response_text = await browser_mgr.send_message(user_prompt)
         return {
-            "browser_alive": alive,
-            "logged_in": self.logged_in,
-            "engine": self._engine,
-            "uptime_seconds": time.time() - self.start_time,
-            "heartbeat_count": self.heartbeat_count,
-            "requests_handled": self.requests_handled,
-            "current_url": self.page.url if self.page and not self.page.is_closed() else "N/A",
-            "timestamp": datetime.now().isoformat(),
+            "id": f"chatcmpl-{int(time.time()*1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": response_text},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": len(user_prompt),
+                "completion_tokens": len(response_text),
+                "total_tokens": len(user_prompt) + len(response_text)
+            }
         }
 
-    async def take_screenshot_base64(self) -> Optional[str]:
-        try:
-            if not self.page or self.page.is_closed():
-                return None
-            screenshot_bytes = await self.page.screenshot(full_page=False)
-            return base64.b64encode(screenshot_bytes).decode("utf-8")
-        except Exception as e:
-            print(f"❌ 截图失败: {e}")
-            return None
 
-    async def send_message(self, message: str) -> str:
-        full_response = ""
-        async for chunk in self.send_message_stream(message):
-            full_response += chunk
-        return full_response
-
-    async def send_message_stream(self, message: str) -> AsyncGenerator[str, None]:
-        async with self._lock:
-            self.requests_handled += 1
-            print(f"📨 处理第 {self.requests_handled} 个请求 (长度: {len(message)} 字符)")
-            print(f"  → 内容预览: {message[:100]}...")
-
+# ============================================================
+# WebSocket 端点
+# ============================================================
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    print(f"📡 WebSocket 客户端已连接: {websocket.client}")
+    try:
+        while True:
+            data = await websocket.receive_text()
             try:
-                # 确保在正确的页面上
-                current_url = self.page.url if self.page else ""
-                if "chat.deepseek.com" not in current_url:
-                    await self.page.goto(
-                        "https://chat.deepseek.com/",
-                        wait_until="networkidle",
-                        timeout=30000,
-                    )
-                    await asyncio.sleep(2)
-
-                # 开启新对话
-                print("  → 正在开启新的对话以保证上下文干净...")
-                try:
-                    new_chat_btn = self.page.locator(
-                        "xpath=//*[contains(text(), '开启新对话')]"
-                    ).first
-                    await new_chat_btn.wait_for(state="visible", timeout=5000)
-                    await new_chat_btn.click()
-                    await asyncio.sleep(1)
-                    print("  ✅ 已开启新对话")
-                except Exception:
-                    try:
-                        icon_btn = self.page.locator(
-                            "div.ds-icon-button, [class*='new-chat']"
-                        ).first
-                        if await icon_btn.is_visible(timeout=2000):
-                            await icon_btn.click()
-                            await asyncio.sleep(1)
-                    except Exception:
-                        pass
-
-                # 输入消息
-                textarea = self.page.locator(
-                    "textarea[placeholder*='DeepSeek'], "
-                    "textarea[placeholder*='发送消息'], "
-                    "textarea, "
-                    "[contenteditable='true']"
-                ).first
-                await textarea.wait_for(state="visible", timeout=10000)
-                await textarea.click()
-                await asyncio.sleep(0.3)
-
-                await textarea.fill("")
-                await asyncio.sleep(0.2)
-                await textarea.fill(message)
-                await asyncio.sleep(0.5)
-                print(f"  → 已输入消息，长度: {len(message)}")
-
-                # 发送
-                await textarea.press("Enter")
-                print("  → 消息已发送，等待模型响应...")
-                await asyncio.sleep(2)
-
-                # 流式读取响应
-                last_text = ""
-                stable_count = 0
-                max_wait_seconds = 600
-                response_started = False
-
-                for tick in range(max_wait_seconds * 2):
-                    await asyncio.sleep(0.5)
-
-                    result = await self.page.evaluate("""
-                        () => {
-                            const items = document.querySelectorAll('div[data-virtual-list-item-key]');
-                            if (items.length === 0) {
-                                return { text: '', done: false, itemCount: 0, hasButton: false };
-                            }
-                            const lastItem = items[items.length - 1];
-                            const mdEls = lastItem.querySelectorAll('[class*="ds-markdown"]');
-                            let text = '';
-                            if (mdEls.length > 0) {
-                                text = mdEls[mdEls.length - 1].textContent || '';
-                            }
-                            const buttons = lastItem.querySelectorAll('div[role="button"]');
-                            const hasButton = buttons.length > 0;
-                            const stopBtn = document.querySelector('[class*="stop"], [class*="square"]');
-                            const isGenerating = !!stopBtn;
-                            return { 
-                                text: text, 
-                                done: hasButton && !isGenerating,
-                                itemCount: items.length, 
-                                hasButton: hasButton,
-                                isGenerating: isGenerating
-                            };
-                        }
-                    """)
-
-                    current_text = result.get("text", "").strip()
-                    is_done = result.get("done", False)
-                    is_generating = result.get("isGenerating", False)
-
-                    if current_text and not response_started:
-                        response_started = True
-                        print(f"  → 检测到回复开始（消息数: {result.get('itemCount')}）")
-
-                    if response_started and current_text:
-                        if len(current_text) > len(last_text):
-                            new_part = current_text[len(last_text):]
-                            last_text = current_text
-                            stable_count = 0
-                            yield new_part
-                        elif current_text == last_text:
-                            stable_count += 1
-
-                        if is_done and stable_count >= 3:
-                            print("  ✅ 响应完成（检测到复制按钮可用）。")
-                            break
-
-                    if tick > 0 and tick % 20 == 0:
-                        print(
-                            f"  ⏳ 等待中... tick={tick}, "
-                            f"textLen={len(current_text)}, "
-                            f"generating={is_generating}, "
-                            f"hasButton={result.get('hasButton')}, "
-                            f"stable={stable_count}"
-                        )
-
-                    if stable_count >= 60:
-                        print("  ⏹️ 响应超时（文本 30 秒无变化）。")
-                        break
-
-                # 兜底
-                if not last_text:
-                    fallback_text = await self.page.evaluate("""
-                        () => {
-                            const allMd = document.querySelectorAll('[class*="ds-markdown"]');
-                            if (allMd.length > 0) {
-                                return allMd[allMd.length - 1].textContent || '';
-                            }
-                            return '';
-                        }
-                    """)
-                    if fallback_text and fallback_text.strip():
-                        print(f"  ⚠️ 使用兜底方式获取到回复，长度: {len(fallback_text)}")
-                        yield fallback_text.strip()
-                    else:
-                        print("  ❌ 完全未能获取到响应")
-                        yield "抱歉，未能获取到响应。请稍后重试。"
-
-                print(f"  📊 最终回复长度: {len(last_text)} 字符")
-
-            except Exception as e:
-                error_msg = f"发送消息时出错: {str(e)}"
-                print(f"  ❌ {error_msg}")
-                import traceback
-                traceback.print_exc()
-                yield f"[错误] {error_msg}"
-
-    async def simulate_activity(self):
-        """心跳模拟活动"""
-        if not self.page or self.page.is_closed():
-            return
+                payload = json.loads(data)
+                message = payload.get("message", "")
+            except json.JSONDecodeError:
+                message = data
+            if not message:
+                await websocket.send_json({"error": "消息不能为空"})
+                continue
+            if not browser_mgr or not await browser_mgr.is_alive():
+                await websocket.send_json({"error": "浏览器会话未就绪"})
+                continue
+            await websocket.send_json({"type": "start"})
+            full_response = ""
+            async for chunk in browser_mgr.send_message_stream(message):
+                full_response += chunk
+                await websocket.send_json({"type": "chunk", "content": chunk})
+            await websocket.send_json({"type": "end", "full_content": full_response})
+    except WebSocketDisconnect:
+        print(f"📡 WebSocket 客户端已断开: {websocket.client}")
+    except Exception as e:
+        print(f"❌ WebSocket 错误: {e}")
         try:
-            self.heartbeat_count += 1
-            import random
-            x = random.randint(100, 1800)
-            y = random.randint(100, 900)
-            await self.page.mouse.move(x, y)
-            await self.page.evaluate("""
-                () => {
-                    document.dispatchEvent(new MouseEvent('mousemove', {
-                        clientX: Math.random() * window.innerWidth,
-                        clientY: Math.random() * window.innerHeight
-                    }));
-                    window.scrollBy(0, Math.random() > 0.5 ? 1 : -1);
-                    window.dispatchEvent(new Event('focus'));
-                }
-            """)
-            if self.heartbeat_count % 10 == 0:
-                print(f"💓 心跳 #{self.heartbeat_count} - 页面: {self.page.url[:60]}...")
-        except Exception as e:
-            print(f"⚠️ 心跳异常: {e}")
-
-    async def shutdown(self):
-        """安全关闭所有资源"""
-        try:
-            if self.page and not self.page.is_closed():
-                await self.page.close()
+            await websocket.send_json({"error": str(e)})
         except Exception:
             pass
 
-        try:
-            if self.context:
-                await self.context.close()
-        except Exception:
-            pass
 
-        try:
-            if self._camoufox_cm:
-                await self._camoufox_cm.__aexit__(None, None, None)
-                self._camoufox_cm = None
-            elif self.browser:
-                await self.browser.close()
-        except Exception:
-            pass
-
-        try:
-            if self.playwright:
-                await self.playwright.stop()
-        except Exception:
-            pass
-
-        print("🔒 浏览器已安全关闭。")
+# ============================================================
+# 入口
+# ============================================================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 启动服务，监听端口: {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
