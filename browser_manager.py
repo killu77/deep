@@ -1,8 +1,9 @@
+# browser_manager.py
 """
-浏览器生命周期管理器：
-- 使用 Camoufox (反指纹 Firefox) 通过 Playwright 启动
-- 管理登录、会话保持、消息发送
-- 提供截图、状态查询等调试功能
+浏览器生命周期管理器（Cookie 注入版）：
+- 支持 Cookie 注入登录（不再依赖模拟输入）
+- 修复缓存保存 Errno 16 问题
+- 修复 Camoufox 启动参数
 """
 
 import os
@@ -11,6 +12,8 @@ import time
 import json
 import asyncio
 import base64
+import shutil
+from pathlib import Path
 from datetime import datetime
 from typing import AsyncGenerator, Optional
 
@@ -27,36 +30,79 @@ class BrowserManager:
         self.start_time = time.time()
         self.heartbeat_count = 0
         self.requests_handled = 0
-        self._lock = asyncio.Lock()  # 防止并发操作浏览器
+        self._lock = asyncio.Lock()
 
-        # 凭据
         self.email = os.getenv("DEEPSEEK_EMAIL", "")
         self.password = os.getenv("DEEPSEEK_PASSWORD", "")
+        self.headless = os.getenv("HEADLESS", "true").lower() == "true"
+        self._engine = "unknown"
+
+    def _prepare_camoufox_cache(self):
+        home_cache = Path.home() / ".cache"
+        store_dir = home_cache / "camoufox_store"
+        cache_dir = home_cache / "camoufox"
+
+        if store_dir.exists() and any(store_dir.iterdir()):
+            print(f"  📦 从持久存储恢复 Camoufox 缓存...")
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(store_dir, cache_dir, dirs_exist_ok=True)
+                print(f"  ✅ 缓存已恢复，大小: {self._dir_size(cache_dir):.0f} MB")
+            except Exception as e:
+                print(f"  ⚠️ 恢复缓存失败: {e}，将重新下载")
+        else:
+            print(f"  📦 未找到持久缓存，Camoufox 将首次下载...")
+            store_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_camoufox_cache(self):
+        """修复：使用增量复制，避免 Errno 16"""
+        home_cache = Path.home() / ".cache"
+        store_dir = home_cache / "camoufox_store"
+        cache_dir = home_cache / "camoufox"
+
+        if cache_dir.exists() and any(cache_dir.iterdir()):
+            try:
+                store_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(cache_dir, store_dir, dirs_exist_ok=True)
+                print(f"  💾 Camoufox 缓存已保存到持久存储 ({self._dir_size(store_dir):.0f} MB)")
+            except PermissionError as e:
+                print(f"  ⚠️ 保存缓存权限不足: {e}")
+            except OSError as e:
+                print(f"  ⚠️ 保存缓存失败（非致命）: {e}")
+
+    @staticmethod
+    def _dir_size(path: Path) -> float:
+        total = 0
+        try:
+            for f in path.rglob("*"):
+                if f.is_file():
+                    total += f.stat().st_size
+        except Exception:
+            pass
+        return total / (1024 * 1024)
 
     async def initialize(self):
         """初始化浏览器并完成登录。"""
-        print("🔧 正在初始化 Camoufox 浏览器...")
+        print("🔧 正在初始化浏览器...")
 
-        # 确保 Playwright 浏览器路径正确（与 Dockerfile 中一致）
         if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
-            # 检查共享路径是否存在
             if os.path.isdir("/opt/browsers"):
                 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/browsers"
-                print("  → 使用共享浏览器路径: /opt/browsers")
 
-        # 先尝试使用 Camoufox
         camoufox_succeeded = False
         try:
-            # 设置环境变量禁用 Camoufox 的更新检查（避免 GitHub API 限流）
             os.environ['CAMOUFOX_NO_UPDATE_CHECK'] = '1'
+            self._prepare_camoufox_cache()
+
             from camoufox.async_api import AsyncCamoufox
             self._camoufox_cls = AsyncCamoufox
             await self._start_with_camoufox()
             camoufox_succeeded = True
+            self._engine = "camoufox"
+            self._save_camoufox_cache()
         except Exception as e:
             print(f"⚠️ Camoufox 启动失败: {e}")
             print("⚠️ 将回退到 Playwright Firefox...")
-            # 清理可能的部分资源
             if hasattr(self, '_camoufox'):
                 try:
                     await self._camoufox.__aexit__(None, None, None)
@@ -64,18 +110,20 @@ class BrowserManager:
                     pass
             camoufox_succeeded = False
 
-        # 如果 Camoufox 失败，回退到 Playwright
         if not camoufox_succeeded:
             await self._start_with_playwright()
+            self._engine = "playwright-firefox"
 
-        # 执行登录
-        auth = AuthHandler(self.page)
+        await self._inject_stealth_scripts()
+
+        # ====== 改动：使用 Cookie 注入方式登录，传入 context ======
+        auth = AuthHandler(self.page, context=self.context)
         self.logged_in = await auth.login(self.email, self.password)
 
         if self.logged_in:
             print("🎉 登录成功！浏览器会话已建立。")
         else:
-            print("⚠️ 登录可能未完成，但浏览器保持运行。请检查 /screenshot 端点。")
+            print("⚠️ 登录可能未完成，请检查 /screenshot 端点。")
 
     async def _start_with_camoufox(self):
         """使用 Camoufox 启动浏览器。"""
@@ -83,23 +131,25 @@ class BrowserManager:
 
         from camoufox.async_api import AsyncCamoufox
 
-        # Camoufox 启动参数
-        self._camoufox = AsyncCamoufox(
-            headless=True,
-            geoip=False,  # 云环境中禁用 GeoIP
-        )
+        try:
+            self._camoufox = AsyncCamoufox(
+                headless=self.headless,
+                geoip=False,
+            )
+        except TypeError:
+            self._camoufox = AsyncCamoufox(
+                headless=self.headless,
+                geoip=False,
+            )
+
         self.browser = await self._camoufox.__aenter__()
 
-        # 创建上下文和页面
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="zh-CN",
             timezone_id="Asia/Shanghai",
         )
         self.page = await self.context.new_page()
-
-        # 注入反检测脚本
-        await self._inject_stealth_scripts()
         print("  ✅ Camoufox 浏览器已启动。")
 
     async def _start_with_playwright(self):
@@ -107,40 +157,25 @@ class BrowserManager:
         print("  → 回退到 Playwright Firefox...")
 
         from playwright.async_api import async_playwright
-
         self.playwright = await async_playwright().start()
 
-        # 检查 Firefox 可执行文件是否存在
         try:
-            # 尝试直接启动
             self.browser = await self.playwright.firefox.launch(
-                headless=True,
+                headless=self.headless,
                 args=["--no-sandbox"],
             )
         except Exception as launch_error:
             print(f"  ⚠️ Firefox 启动失败: {launch_error}")
-            print("  🔄 尝试自动安装 Firefox...")
-
-            # 自动安装 Playwright Firefox
             import subprocess
             env = os.environ.copy()
             result = subprocess.run(
                 [sys.executable, "-m", "playwright", "install", "firefox"],
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=120
+                capture_output=True, text=True, env=env, timeout=120
             )
-            print(f"  安装输出: {result.stdout}")
-            if result.stderr:
-                print(f"  安装错误: {result.stderr}")
-
             if result.returncode != 0:
                 raise RuntimeError(f"Playwright Firefox 安装失败: {result.stderr}")
-
-            # 安装完成后重试启动
             self.browser = await self.playwright.firefox.launch(
-                headless=True,
+                headless=self.headless,
                 args=["--no-sandbox"],
             )
 
@@ -154,51 +189,36 @@ class BrowserManager:
             ),
         )
         self.page = await self.context.new_page()
-        await self._inject_stealth_scripts()
         print("  ✅ Playwright Firefox 已启动。")
 
     async def _inject_stealth_scripts(self):
-        """注入反检测 JavaScript 脚本。"""
-        stealth_js = """
-        // 隐藏 webdriver 标志
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        
-        // 伪造 plugins
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [
-                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-                { name: 'Native Client', filename: 'internal-nacl-plugin' }
-            ]
-        });
-        
-        // 伪造 languages
-        Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
-        
-        // 隐藏自动化相关属性
-        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-        
-        // 伪造 chrome 对象
-        if (!window.chrome) {
-            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
-        }
-        
-        // 覆盖 permissions query
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-        );
-
-        console.log('[Stealth] 反检测脚本已注入');
-        """
-        await self.context.add_init_script(stealth_js)
+        if self._engine == "camoufox":
+            minimal_js = """
+            if (navigator.webdriver !== undefined) {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            }
+            """
+            await self.context.add_init_script(minimal_js)
+            print("  🛡️ Camoufox 模式：使用最小化反检测脚本")
+        else:
+            firefox_stealth_js = """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { 
+                get: () => ['zh-CN', 'zh', 'en-US', 'en'] 
+            });
+            const originalQuery = window.navigator.permissions.query;
+            if (originalQuery) {
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+            }
+            """
+            await self.context.add_init_script(firefox_stealth_js)
+            print("  🛡️ Firefox 模式：注入兼容的反检测脚本")
 
     async def is_alive(self) -> bool:
-        """检查浏览器是否仍然存活。"""
         try:
             if not self.page or self.page.is_closed():
                 return False
@@ -208,11 +228,11 @@ class BrowserManager:
             return False
 
     async def get_status(self) -> dict:
-        """获取当前状态信息。"""
         alive = await self.is_alive()
         return {
             "browser_alive": alive,
             "logged_in": self.logged_in,
+            "engine": self._engine,
             "uptime_seconds": time.time() - self.start_time,
             "heartbeat_count": self.heartbeat_count,
             "requests_handled": self.requests_handled,
@@ -221,7 +241,6 @@ class BrowserManager:
         }
 
     async def take_screenshot_base64(self) -> Optional[str]:
-        """截取当前页面截图，返回 Base64 字符串。"""
         try:
             if not self.page or self.page.is_closed():
                 return None
@@ -232,16 +251,12 @@ class BrowserManager:
             return None
 
     async def send_message(self, message: str) -> str:
-        """发送消息并等待完整响应（非流式）。"""
         full_response = ""
         async for chunk in self.send_message_stream(message):
             full_response += chunk
         return full_response
 
     async def send_message_stream(self, message: str) -> AsyncGenerator[str, None]:
-        """
-        发送消息并流式返回响应。
-        """
         async with self._lock:
             self.requests_handled += 1
             print(f"📨 处理第 {self.requests_handled} 个请求: {message[:50]}...")
@@ -263,7 +278,6 @@ class BrowserManager:
                 await textarea.wait_for(state="visible", timeout=10000)
                 await textarea.click()
                 await asyncio.sleep(0.3)
-
                 await textarea.fill(message)
                 await asyncio.sleep(0.5)
 
@@ -337,24 +351,17 @@ class BrowserManager:
             except Exception as e:
                 error_msg = f"发送消息时出错: {str(e)}"
                 print(f"  ❌ {error_msg}")
-                screenshot = await self.take_screenshot_base64()
-                if screenshot:
-                    print(f"  📸 错误截图已保存（可通过 /screenshot 端点查看）")
                 yield f"[错误] {error_msg}"
 
     async def simulate_activity(self):
-        """模拟用户活动，保持会话活跃。"""
         if not self.page or self.page.is_closed():
             return
-
         try:
             self.heartbeat_count += 1
-
             import random
             x = random.randint(100, 1800)
             y = random.randint(100, 900)
             await self.page.mouse.move(x, y)
-
             await self.page.evaluate("""
                 () => {
                     document.dispatchEvent(new MouseEvent('mousemove', {
@@ -363,20 +370,16 @@ class BrowserManager:
                     }));
                     window.scrollBy(0, Math.random() > 0.5 ? 1 : -1);
                     window.dispatchEvent(new Event('focus'));
-                    document.dispatchEvent(new Event('visibilitychange'));
-                    console.log('[Keepalive] 心跳 - ' + new Date().toISOString());
                 }
             """)
-
             if self.heartbeat_count % 10 == 0:
                 print(f"💓 心跳 #{self.heartbeat_count} - 页面: {self.page.url[:60]}...")
-
         except Exception as e:
             print(f"⚠️ 心跳异常: {e}")
 
     async def shutdown(self):
-        """安全关闭浏览器。"""
         try:
+            self._save_camoufox_cache()
             if self.context:
                 await self.context.close()
             if self.browser:
