@@ -1,10 +1,4 @@
 # browser_manager.py
-"""
-DeepSeek 反代（多页面并发 + DOM 通道）
-- 多标签页并发
-- DOM 轮询读取回复
-- 正确处理内容审查替换
-"""
 
 import os
 import sys
@@ -21,8 +15,6 @@ from auth_handler import AuthHandler
 
 
 class ChatPage:
-    """单个聊天页面的封装"""
-
     def __init__(self, page, page_id: int):
         self.page = page
         self.page_id = page_id
@@ -100,7 +92,35 @@ class ChatPage:
         await textarea.press("Enter")
         await asyncio.sleep(1)
 
-    async def get_response_state(self) -> dict:
+    async def read_response_instant(self) -> str:
+        """
+        立刻读取最后一个对话项的 ds-markdown 文本。
+        不等待，不延迟，调用时立刻读。
+        """
+        try:
+            text = await self.page.evaluate("""
+                () => {
+                    const items = document.querySelectorAll(
+                        'div[data-virtual-list-item-key]'
+                    );
+                    if (items.length === 0) return '';
+                    const lastItem = items[items.length - 1];
+                    const mdEls = lastItem.querySelectorAll(
+                        '[class*="ds-markdown"]'
+                    );
+                    if (mdEls.length === 0) return '';
+                    return mdEls[mdEls.length - 1].textContent || '';
+                }
+            """)
+            return (text or "").strip()
+        except Exception:
+            return ""
+
+    async def check_button_and_read(self) -> dict:
+        """
+        一次 evaluate 调用同时检查复制按钮 + 读取文本。
+        保证读到的文本和按钮状态是同一瞬间的。
+        """
         return await self.page.evaluate("""
             () => {
                 const items = document.querySelectorAll(
@@ -108,15 +128,16 @@ class ChatPage:
                 );
                 if (items.length === 0) {
                     return {
-                        text: '',
                         hasButton: false,
                         isGenerating: false,
+                        text: '',
                         itemCount: 0,
                     };
                 }
 
                 const lastItem = items[items.length - 1];
 
+                // 读文本
                 const mdEls = lastItem.querySelectorAll(
                     '[class*="ds-markdown"]'
                 );
@@ -125,11 +146,13 @@ class ChatPage:
                     text = mdEls[mdEls.length - 1].textContent || '';
                 }
 
+                // 复制按钮
                 const buttons = lastItem.querySelectorAll(
                     'div[role="button"]'
                 );
                 const hasButton = buttons.length > 0;
 
+                // 正在生成
                 const stopBtn = document.querySelector(
                     '[class*="stop"], [class*="square"]'
                 );
@@ -137,40 +160,13 @@ class ChatPage:
                     stopBtn.offsetParent !== null;
 
                 return {
-                    text: text,
                     hasButton: hasButton,
                     isGenerating: isGenerating,
+                    text: text,
                     itemCount: items.length,
                 };
             }
         """)
-
-    async def read_dom_response(self) -> str:
-        try:
-            text = await self.page.evaluate("""
-                () => {
-                    const items = document.querySelectorAll(
-                        'div[data-virtual-list-item-key]'
-                    );
-                    if (items.length > 0) {
-                        const last = items[items.length - 1];
-                        const md = last.querySelectorAll(
-                            '[class*="ds-markdown"]'
-                        );
-                        if (md.length > 0)
-                            return md[md.length - 1].textContent || '';
-                    }
-                    const allMd = document.querySelectorAll(
-                        '[class*="ds-markdown"]'
-                    );
-                    if (allMd.length > 0)
-                        return allMd[allMd.length - 1].textContent || '';
-                    return '';
-                }
-            """)
-            return (text or "").strip()
-        except Exception:
-            return ""
 
     async def is_alive(self) -> bool:
         try:
@@ -376,8 +372,6 @@ class BrowserManager:
         cp.busy = False
         self._page_semaphore.release()
 
-    # ══════════════════════════════════════════════════════
-
     async def send_message(self, message: str) -> str:
         full = ""
         async for chunk in self.send_message_stream(message):
@@ -431,85 +425,85 @@ class BrowserManager:
             await cp.type_and_send(message)
             print(f"  [{req_id}] 等待回复...")
 
-            # ═══ DOM 轮询 ═══
-            # 策略：不做流式输出，等复制按钮出现后一次性读取
-            # 这样最稳定，跟 Selenium 版本完全一致
-            # 流式效果在 app.py 层用分块模拟
+            # ═══════════════════════════════════════════
+            # 核心逻辑：跟 Selenium 版一样
+            # 只等复制按钮出现，按钮出现的那一刻文本就在同一次
+            # evaluate 里一起读出来了，不给审查替换的时间窗口
+            # ═══════════════════════════════════════════
 
             max_wait_seconds = 600
-            response_started = False
-            last_len = 0
-            stable_count = 0
+            captured_text = ""
 
             for tick in range(max_wait_seconds * 2):
                 await asyncio.sleep(0.5)
 
                 try:
-                    state = await cp.get_response_state()
+                    # 关键：一次 evaluate 同时检查按钮 + 读文本
+                    # 按钮出现的瞬间文本一定是原始内容
+                    state = await cp.check_button_and_read()
                 except Exception:
                     continue
 
-                current_text = (state.get("text") or "").strip()
                 has_button = state.get("hasButton", False)
                 is_generating = state.get("isGenerating", False)
-                current_len = len(current_text)
+                text = (state.get("text") or "").strip()
+                item_count = state.get("itemCount", 0)
 
-                if current_text and not response_started:
-                    response_started = True
-                    print(f"  [{req_id}] 回复开始")
+                # 还在生成中，继续等
+                if is_generating:
+                    if tick > 0 and tick % 40 == 0:
+                        print(f"  [{req_id}] ⏳ 生成中... "
+                              f"len={len(text)} tick={tick}")
+                    continue
 
-                if response_started:
-                    if current_len != last_len:
-                        # 文本有变化（变长或变短都算）
-                        last_len = current_len
-                        stable_count = 0
-                    else:
-                        stable_count += 1
+                # 复制按钮出现了！立刻抢文本
+                if has_button and text:
+                    captured_text = text
+                    print(f"  [{req_id}] ✅ 复制按钮出现，"
+                          f"立刻捕获 {len(text)} 字符")
+                    break
 
-                    # 完成判定：复制按钮出现 + 不在生成 + 文本稳定
-                    if has_button and not is_generating and stable_count >= 3:
-                        print(f"  [{req_id}] ✅ 回复完成")
-                        break
-
-                    # 备用判定：不在生成 + 文本稳定较长时间
-                    if not is_generating and stable_count >= 10:
-                        print(f"  [{req_id}] ✅ 回复完成（稳定）")
-                        break
-
-                    # 超长稳定
-                    if stable_count >= 60:
-                        print(f"  [{req_id}] ⏹️ 超时（30s无变化）")
+                # 没有在生成，也没有按钮，但有文本
+                # 可能按钮还没渲染出来，再等几轮
+                if not is_generating and text and tick > 10:
+                    # 给按钮渲染 2 秒时间
+                    await asyncio.sleep(0.3)
+                    state2 = await cp.check_button_and_read()
+                    if state2.get("hasButton"):
+                        captured_text = (state2.get("text") or "").strip()
+                        print(f"  [{req_id}] ✅ 延迟捕获 "
+                              f"{len(captured_text)} 字符")
                         break
 
                 # 进度日志
                 if tick > 0 and tick % 20 == 0:
                     print(
                         f"  [{req_id}] ⏳ tick={tick} "
-                        f"len={current_len} "
+                        f"len={len(text)} "
                         f"gen={is_generating} "
                         f"btn={has_button} "
-                        f"stable={stable_count}"
+                        f"items={item_count}"
                     )
 
-                if not response_started and tick > 120:
+                # 超时
+                if tick > 120 and not text:
                     print(f"  [{req_id}] ❌ 60秒无回复")
                     break
 
-            # ═══ 读取最终文本 ═══
-            final_text = await cp.read_dom_response()
-
-            if final_text:
-                print(f"  [{req_id}] 📊 最终长度: {len(final_text)}")
-                yield final_text
+            # 输出结果
+            if captured_text:
+                yield captured_text
+                print(f"  [{req_id}] 📊 页面#{cp.page_id} "
+                      f"完成: {len(captured_text)} 字符")
             else:
-                print(f"  [{req_id}] ❌ 完全无响应")
-                try:
-                    ss = await self.take_screenshot_base64()
-                    if ss:
-                        print(f"  [{req_id}] 📸 截图已生成")
-                except Exception:
-                    pass
-                yield "抱歉，未能获取到响应。请稍后重试。"
+                # 最后一搏：直接读 DOM
+                fallback = await cp.read_response_instant()
+                if fallback:
+                    yield fallback
+                    print(f"  [{req_id}] 📋 兜底: {len(fallback)} 字符")
+                else:
+                    yield "抱歉，未能获取到响应。请稍后重试。"
+                    print(f"  [{req_id}] ❌ 完全无响应")
 
         except Exception as e:
             print(f"  [{req_id}] ❌ {e}")
@@ -520,8 +514,6 @@ class BrowserManager:
         finally:
             if cp:
                 self._release_page(cp)
-
-    # ── 其他 ──
 
     async def is_alive(self) -> bool:
         if not self._ready or not self._pages:
@@ -545,7 +537,7 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "multi-page-dom",
+            "mode": "multi-page-instant-capture",
             "has_token": True,
             "cookie_count": 0,
             "page_count": len(self._pages),
@@ -587,7 +579,8 @@ class BrowserManager:
                                     clientY: Math.random() * window.innerHeight
                                 }
                             ));
-                            window.scrollBy(0, Math.random() > 0.5 ? 1 : -1);
+                            window.scrollBy(0,
+                                Math.random() > 0.5 ? 1 : -1);
                         }
                     """)
             except Exception:
