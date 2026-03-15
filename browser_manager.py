@@ -1,9 +1,10 @@
 # browser_manager.py
 """
-DeepSeek 反代（双通道模式）
-- 主通道：addInitScript 网络拦截，实时逐 chunk 捕获 SSE
-- 备用通道：等复制按钮出现后一次性读 DOM（selenium 思路）
-- 主通道优先（抗审查），备用通道兜底（抗拦截失败）
+DeepSeek 反代（多页面并发 + DOM 通道）
+- 一个浏览器开 N 个标签页，每个页面独立会话
+- 请求进来自动分配到空闲页面
+- 通过等待复制按钮出现来判断回复完成（Selenium 验证过的方案）
+- 从 ds-markdown DOM 元素读取完整回复
 """
 
 import os
@@ -20,199 +21,174 @@ from typing import AsyncGenerator, Optional
 from auth_handler import AuthHandler
 
 
-INIT_INTERCEPT_SCRIPT = """
-(() => {
-    if (window.__ds_interceptor_installed) return;
-    window.__ds_interceptor_installed = true;
+class ChatPage:
+    """单个聊天页面的封装"""
 
-    window.__ds_chunks = [];
-    window.__ds_stream_done = false;
-    window.__ds_stream_error = null;
-    window.__ds_capture_active = false;
-    window.__ds_raw_events = [];
+    def __init__(self, page, page_id: int):
+        self.page = page
+        self.page_id = page_id
+        self.busy = False
+        self.request_count = 0
+        self.last_used = 0.0
 
-    window.__ds_reset = () => {
-        window.__ds_chunks = [];
-        window.__ds_stream_done = false;
-        window.__ds_stream_error = null;
-        window.__ds_raw_events = [];
-    };
+    async def start_new_chat(self):
+        if "chat.deepseek.com" not in self.page.url:
+            await self.page.goto(
+                "https://chat.deepseek.com/",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            await asyncio.sleep(2)
 
-    function extractContent(dataStr) {
-        try {
-            const parsed = JSON.parse(dataStr);
+        for sel in [
+            "xpath=//*[contains(text(), '开启新对话')]",
+            "xpath=//*[contains(text(), '新对话')]",
+            "xpath=//*[contains(text(), 'New chat')]",
+            "div.ds-icon-button",
+            "[class*='new-chat']",
+        ]:
+            try:
+                btn = self.page.locator(sel).first
+                if await btn.is_visible(timeout=2000):
+                    await btn.click()
+                    await asyncio.sleep(1)
+                    return
+            except Exception:
+                continue
 
-            // DeepSeek 格式：fragments 里面有 content
-            if (parsed.v && parsed.v.response) {
-                const fragments = parsed.v.response.fragments || [];
-                let text = '';
-                for (const frag of fragments) {
-                    if (frag.content !== undefined && frag.content !== null) {
-                        text += frag.content;
-                    }
-                }
-                return { type: 'deepseek', text: text };
-            }
+        await self.page.goto(
+            "https://chat.deepseek.com/",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        await asyncio.sleep(3)
 
-            // OpenAI 格式
-            if (parsed.choices && parsed.choices.length > 0) {
-                const delta = parsed.choices[0].delta || {};
-                if (delta.content) return { type: 'openai', text: delta.content };
-            }
+    async def type_and_send(self, message: str):
+        textarea = self.page.locator(
+            "textarea[placeholder*='DeepSeek'], "
+            "textarea[placeholder*='发送消息'], "
+            "textarea, "
+            "[contenteditable='true']"
+        ).first
+        await textarea.wait_for(state="visible", timeout=10000)
+        await textarea.click()
+        await asyncio.sleep(0.3)
 
-            return null;
-        } catch (e) {
-            return null;
-        }
-    }
-
-    async function processStream(reader) {
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let lastFullText = '';
-
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\\n');
-                buffer = lines.pop();
-
-                for (const line of lines) {
-                    const trimmed = line.trim();
-                    if (!trimmed.startsWith('data: ')) continue;
-                    const dataStr = trimmed.substring(6).trim();
-
-                    // 保存原始事件用于调试
-                    if (window.__ds_raw_events.length < 50) {
-                        window.__ds_raw_events.push(dataStr.substring(0, 200));
-                    }
-
-                    if (dataStr === '[DONE]') {
-                        window.__ds_stream_done = true;
-                        return;
-                    }
-
-                    const result = extractContent(dataStr);
-                    if (!result) continue;
-
-                    if (result.type === 'deepseek') {
-                        // DeepSeek 每次推送完整累积文本，取增量
-                        if (result.text.length > lastFullText.length) {
-                            const delta = result.text.substring(lastFullText.length);
-                            window.__ds_chunks.push(delta);
-                            lastFullText = result.text;
-                        }
-                    } else if (result.type === 'openai') {
-                        window.__ds_chunks.push(result.text);
-                    }
-                }
-            }
-        } catch (e) {
-            window.__ds_stream_error = e.message;
-        }
-        window.__ds_stream_done = true;
-    }
-
-    // ═══ Patch fetch ═══
-    const _origFetch = window.fetch;
-    window.fetch = async function(...args) {
-        const resp = await _origFetch.apply(this, args);
-        const url = (typeof args[0] === 'string') ? args[0] : (args[0]?.url || '');
-
-        if (window.__ds_capture_active && url.includes('/chat/completion')) {
-            const ct = resp.headers.get('content-type') || '';
-            if (ct.includes('text/event-stream') || ct.includes('application/')) {
-                console.log('[DS] fetch 捕获 completion');
-                const cloned = resp.clone();
-                processStream(cloned.body.getReader());
-            }
-        }
-        return resp;
-    };
-
-    // ═══ Patch XHR ═══
-    const _origOpen = XMLHttpRequest.prototype.open;
-    const _origSend = XMLHttpRequest.prototype.send;
-
-    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-        this.__ds_url = url;
-        return _origOpen.call(this, method, url, ...rest);
-    };
-
-    XMLHttpRequest.prototype.send = function(body) {
-        if (window.__ds_capture_active && this.__ds_url &&
-            this.__ds_url.includes('/chat/completion')) {
-            console.log('[DS] XHR 捕获 completion');
-            let xhrBuf = '';
-            let xhrLast = '';
-
-            this.addEventListener('progress', function() {
-                try {
-                    const newData = (this.responseText || '').substring(xhrBuf.length);
-                    xhrBuf = this.responseText || '';
-
-                    for (const line of newData.split('\\n')) {
-                        const t = line.trim();
-                        if (!t.startsWith('data: ')) continue;
-                        const ds = t.substring(6).trim();
-                        if (ds === '[DONE]') { window.__ds_stream_done = true; return; }
-
-                        const r = extractContent(ds);
-                        if (!r) continue;
-                        if (r.type === 'deepseek') {
-                            if (r.text.length > xhrLast.length) {
-                                window.__ds_chunks.push(r.text.substring(xhrLast.length));
-                                xhrLast = r.text;
-                            }
-                        } else {
-                            window.__ds_chunks.push(r.text);
-                        }
-                    }
-                } catch(e) {}
-            });
-            this.addEventListener('loadend', () => { window.__ds_stream_done = true; });
-            this.addEventListener('error', () => {
-                window.__ds_stream_error = 'XHR error';
-                window.__ds_stream_done = true;
-            });
-        }
-        return _origSend.call(this, body);
-    };
-
-    // ═══ Patch EventSource ═══
-    const _OrigES = window.EventSource;
-    if (_OrigES) {
-        window.EventSource = function(url, cfg) {
-            const es = new _OrigES(url, cfg);
-            if (window.__ds_capture_active && url.includes('/chat/completion')) {
-                console.log('[DS] EventSource 捕获');
-                let esLast = '';
-                es.addEventListener('message', function(ev) {
-                    if (ev.data === '[DONE]') { window.__ds_stream_done = true; return; }
-                    const r = extractContent(ev.data);
-                    if (!r) return;
-                    if (r.type === 'deepseek') {
-                        if (r.text.length > esLast.length) {
-                            window.__ds_chunks.push(r.text.substring(esLast.length));
-                            esLast = r.text;
-                        }
+        try:
+            await textarea.fill("")
+            await asyncio.sleep(0.1)
+            await textarea.fill(message)
+        except Exception:
+            await self.page.evaluate("""
+                (text) => {
+                    const el = document.querySelector('textarea')
+                        || document.querySelector('[contenteditable="true"]');
+                    if (!el) return;
+                    if (el.tagName === 'TEXTAREA') {
+                        const setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, 'value'
+                        ).set;
+                        setter.call(el, text);
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
                     } else {
-                        window.__ds_chunks.push(r.text);
+                        el.innerText = text;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
                     }
-                });
-                es.addEventListener('error', () => { window.__ds_stream_done = true; });
-            }
-            return es;
-        };
-        window.EventSource.prototype = _OrigES.prototype;
-    }
+                }
+            """, message)
 
-    console.log('[DS] 全协议拦截器已安装');
-})();
-"""
+        await asyncio.sleep(0.5)
+        await textarea.press("Enter")
+        await asyncio.sleep(1)
+
+    async def get_response_state(self) -> dict:
+        """
+        获取当前页面的回复状态。
+        与 Selenium 版本完全对齐的选择器逻辑。
+        """
+        return await self.page.evaluate("""
+            () => {
+                const items = document.querySelectorAll(
+                    'div[data-virtual-list-item-key]'
+                );
+                if (items.length === 0) {
+                    return {
+                        text: '',
+                        hasButton: false,
+                        isGenerating: false,
+                        itemCount: 0,
+                    };
+                }
+
+                const lastItem = items[items.length - 1];
+
+                // 获取最后一个 ds-markdown 的文本
+                const mdEls = lastItem.querySelectorAll(
+                    '[class*="ds-markdown"]'
+                );
+                let text = '';
+                if (mdEls.length > 0) {
+                    text = mdEls[mdEls.length - 1].textContent || '';
+                }
+
+                // 复制按钮是否可用（回复完成的标志）
+                const buttons = lastItem.querySelectorAll(
+                    'div[role="button"]'
+                );
+                const hasButton = buttons.length > 0;
+
+                // 是否正在生成
+                const stopBtn = document.querySelector(
+                    '[class*="stop"], [class*="square"]'
+                );
+                const isGenerating = !!stopBtn &&
+                    stopBtn.offsetParent !== null;
+
+                return {
+                    text: text,
+                    hasButton: hasButton,
+                    isGenerating: isGenerating,
+                    itemCount: items.length,
+                };
+            }
+        """)
+
+    async def read_dom_response(self) -> str:
+        """兜底：直接读取最后一个 ds-markdown"""
+        try:
+            text = await self.page.evaluate("""
+                () => {
+                    const items = document.querySelectorAll(
+                        'div[data-virtual-list-item-key]'
+                    );
+                    if (items.length > 0) {
+                        const last = items[items.length - 1];
+                        const md = last.querySelectorAll(
+                            '[class*="ds-markdown"]'
+                        );
+                        if (md.length > 0)
+                            return md[md.length - 1].textContent || '';
+                    }
+                    const allMd = document.querySelectorAll(
+                        '[class*="ds-markdown"]'
+                    );
+                    if (allMd.length > 0)
+                        return allMd[allMd.length - 1].textContent || '';
+                    return '';
+                }
+            """)
+            return (text or "").strip()
+        except Exception:
+            return ""
+
+    async def is_alive(self) -> bool:
+        try:
+            if self.page.is_closed():
+                return False
+            await self.page.evaluate("() => document.title")
+            return True
+        except Exception:
+            return False
 
 
 class BrowserManager:
@@ -220,7 +196,6 @@ class BrowserManager:
         self.playwright = None
         self.browser = None
         self.context = None
-        self.page = None
         self.logged_in = False
         self.start_time = time.time()
         self.heartbeat_count = 0
@@ -232,7 +207,11 @@ class BrowserManager:
         self.headless = os.getenv("HEADLESS", "true").lower() == "true"
         self._engine = "unknown"
 
-        self._lock = asyncio.Lock()
+        # 页面池
+        self._page_count = int(os.getenv("PAGE_COUNT", "3"))
+        self._pages: list[ChatPage] = []
+        self._page_semaphore: asyncio.Semaphore = None
+
         self._ready = False
         self._ready_event = asyncio.Event()
 
@@ -300,17 +279,40 @@ class BrowserManager:
 
         await self._inject_stealth_scripts()
 
-        auth = AuthHandler(self.page, context=self.context)
+        # 用第一个页面登录
+        first_page = await self.context.new_page()
+        auth = AuthHandler(first_page, context=self.context)
         self.logged_in = await auth.login(self.email, self.password)
 
         if not self.logged_in:
             print("⚠️ 登录可能未完成")
+            await first_page.close()
         else:
             print("🎉 登录成功！")
+            self._pages.append(ChatPage(first_page, 0))
+            print(f"  📄 页面 #0 就绪")
+
+        # 创建更多页面（共享 context = 共享登录态）
+        for i in range(1, self._page_count):
+            try:
+                page = await self.context.new_page()
+                await page.goto(
+                    "https://chat.deepseek.com/",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                await asyncio.sleep(2)
+                self._pages.append(ChatPage(page, i))
+                print(f"  📄 页面 #{i} 就绪")
+            except Exception as e:
+                print(f"  ⚠️ 页面 #{i} 创建失败: {e}")
+
+        actual_count = len(self._pages)
+        self._page_semaphore = asyncio.Semaphore(actual_count)
 
         self._ready = True
         self._ready_event.set()
-        print(f"✅ 就绪（引擎: {self._engine}，双通道模式）")
+        print(f"✅ 就绪（引擎: {self._engine}，{actual_count} 个并发页面，DOM 模式）")
 
     async def _start_with_camoufox(self):
         from camoufox.async_api import AsyncCamoufox
@@ -321,8 +323,6 @@ class BrowserManager:
             locale="zh-CN",
             timezone_id="Asia/Shanghai",
         )
-        await self.context.add_init_script(INIT_INTERCEPT_SCRIPT)
-        self.page = await self.context.new_page()
         print("  ✅ Camoufox 已启动")
 
     async def _start_with_playwright(self):
@@ -352,8 +352,6 @@ class BrowserManager:
                 "Gecko/20100101 Firefox/126.0"
             ),
         )
-        await self.context.add_init_script(INIT_INTERCEPT_SCRIPT)
-        self.page = await self.context.new_page()
         print("  ✅ Playwright Firefox 已启动")
 
     async def _inject_stealth_scripts(self):
@@ -370,89 +368,29 @@ class BrowserManager:
                 });
             """)
 
-    async def _ensure_interceptor(self):
-        try:
-            ok = await self.page.evaluate("() => window.__ds_interceptor_installed === true")
-            if not ok:
-                print("  ⚠️ 拦截器丢失，重新注入")
-                await self.page.evaluate(INIT_INTERCEPT_SCRIPT)
-        except Exception:
-            try:
-                await self.page.evaluate(INIT_INTERCEPT_SCRIPT)
-            except Exception as e:
-                print(f"  ❌ 注入失败: {e}")
+    # ══════════════════════════════════════════════════════
+    # 页面池
+    # ══════════════════════════════════════════════════════
 
-    async def _start_new_chat(self):
-        if "chat.deepseek.com" not in self.page.url:
-            await self.page.goto(
-                "https://chat.deepseek.com/",
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
-            await asyncio.sleep(2)
-
-        for sel in [
-            "xpath=//*[contains(text(), '开启新对话')]",
-            "xpath=//*[contains(text(), '新对话')]",
-            "xpath=//*[contains(text(), 'New chat')]",
-            "div.ds-icon-button",
-            "[class*='new-chat']",
-        ]:
-            try:
-                btn = self.page.locator(sel).first
-                if await btn.is_visible(timeout=2000):
-                    await btn.click()
-                    await asyncio.sleep(1)
-                    print("  ✅ 新对话")
-                    return
-            except Exception:
-                continue
-
-        await self.page.goto(
-            "https://chat.deepseek.com/",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        await asyncio.sleep(3)
-
-    async def _type_and_send(self, message: str):
-        textarea = self.page.locator(
-            "textarea[placeholder*='DeepSeek'], "
-            "textarea[placeholder*='发送消息'], "
-            "textarea, "
-            "[contenteditable='true']"
-        ).first
-        await textarea.wait_for(state="visible", timeout=10000)
-        await textarea.click()
-        await asyncio.sleep(0.3)
-
-        try:
-            await textarea.fill("")
+    async def _acquire_page(self) -> ChatPage:
+        await self._page_semaphore.acquire()
+        for cp in self._pages:
+            if not cp.busy:
+                cp.busy = True
+                cp.last_used = time.time()
+                return cp
+        for _ in range(100):
             await asyncio.sleep(0.1)
-            await textarea.fill(message)
-        except Exception:
-            await self.page.evaluate("""
-                (text) => {
-                    const el = document.querySelector('textarea')
-                        || document.querySelector('[contenteditable="true"]');
-                    if (!el) return;
-                    if (el.tagName === 'TEXTAREA') {
-                        const setter = Object.getOwnPropertyDescriptor(
-                            window.HTMLTextAreaElement.prototype, 'value'
-                        ).set;
-                        setter.call(el, text);
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                    } else {
-                        el.innerText = text;
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                    }
-                }
-            """, message)
+            for cp in self._pages:
+                if not cp.busy:
+                    cp.busy = True
+                    cp.last_used = time.time()
+                    return cp
+        raise RuntimeError("无法获取空闲页面")
 
-        await asyncio.sleep(0.5)
-        await textarea.press("Enter")
-        print(f"  → 已发送 ({len(message)} 字符)")
-        await asyncio.sleep(1)
+    def _release_page(self, cp: ChatPage):
+        cp.busy = False
+        self._page_semaphore.release()
 
     # ══════════════════════════════════════════════════════
     # 核心发送
@@ -471,263 +409,225 @@ class BrowserManager:
                 yield "[错误] 浏览器初始化超时"
                 return
 
-        async with self._lock:
-            self.total_requests += 1
-            self.requests_handled += 1
-            req_id = self.total_requests
-            print(f"📨 请求 #{req_id} (长度: {len(message)} 字符)")
+        self.total_requests += 1
+        self.requests_handled += 1
+        req_id = self.total_requests
+        print(f"📨 请求 #{req_id} (长度: {len(message)} 字符)")
 
-            if not self.page:
-                yield "[错误] 浏览器未就绪"
-                return
-
-            try:
-                await self._start_new_chat()
-                await asyncio.sleep(1)
-                await self._ensure_interceptor()
-
-                # 重置 + 开启捕获
-                await self.page.evaluate("""
-                    () => {
-                        window.__ds_reset();
-                        window.__ds_capture_active = true;
-                    }
-                """)
-
-                await self._type_and_send(message)
-
-                # ═══ 双通道并行读取 ═══
-                print(f"  [{req_id}] 双通道等待...")
-
-                full_text = ""
-                read_index = 0
-                max_wait = 600.0
-                waited = 0.0
-                idle_count = 0
-                stream_started = False
-                network_has_data = False
-
-                while waited < max_wait:
-                    # ── 通道1：网络拦截 ──
-                    result = await self.page.evaluate("""
-                        (fromIndex) => ({
-                            chunks: window.__ds_chunks.slice(fromIndex),
-                            total: window.__ds_chunks.length,
-                            done: window.__ds_stream_done,
-                            error: window.__ds_stream_error,
-                            rawCount: window.__ds_raw_events.length,
-                            rawSample: window.__ds_raw_events.slice(0, 3),
-                        })
-                    """, read_index)
-
-                    if result.get("error"):
-                        print(f"  [{req_id}] ❌ 网络层错误: {result['error']}")
-                        break
-
-                    new_chunks = result.get("chunks", [])
-                    if new_chunks:
-                        if not stream_started:
-                            stream_started = True
-                            network_has_data = True
-                            print(f"  [{req_id}] 🌐 网络通道流开始")
-
-                        for chunk in new_chunks:
-                            if chunk == '[CONTENT_REPLACED]':
-                                print(f"  [{req_id}] ⚠️ 内容被审查替换")
-                                continue
-                            full_text += chunk
-                            yield chunk
-                        read_index += len(new_chunks)
-                        idle_count = 0
-
-                    if result.get("done") and not new_chunks:
-                        if network_has_data:
-                            print(f"  [{req_id}] 🌐 网络通道完成")
-                        break
-
-                    # ── 通道2：DOM 备用（复制按钮检测）──
-                    if not new_chunks:
-                        idle_count += 1
-
-                        # 每隔一段时间检查复制按钮
-                        if idle_count % 10 == 0:
-                            dom_status = await self.page.evaluate("""
-                                () => {
-                                    const items = document.querySelectorAll(
-                                        'div[data-virtual-list-item-key]'
-                                    );
-                                    if (items.length === 0) return { ready: false };
-                                    const last = items[items.length - 1];
-                                    const btns = last.querySelectorAll('div[role="button"]');
-                                    const md = last.querySelectorAll('[class*="ds-markdown"]');
-                                    const text = md.length > 0
-                                        ? md[md.length - 1].textContent || ''
-                                        : '';
-                                    return {
-                                        ready: btns.length > 0,
-                                        textLen: text.length,
-                                        hasText: text.length > 0,
-                                    };
-                                }
-                            """)
-
-                            if dom_status.get("ready") and dom_status.get("hasText"):
-                                if not network_has_data:
-                                    # 网络通道完全没数据，用 DOM
-                                    print(f"  [{req_id}] 📋 网络通道无数据，切换 DOM 通道")
-                                    dom_text = await self._read_dom_response()
-                                    if dom_text:
-                                        full_text = dom_text
-                                        yield dom_text
-                                    break
-                                else:
-                                    # 网络通道有数据但已停止，检查 DOM 是否有更多
-                                    if idle_count > 20:
-                                        break
-
-                    sleep_time = 0.05 if idle_count < 50 else 0.2
-                    await asyncio.sleep(sleep_time)
-                    waited += sleep_time
-
-                    # 长时间无数据
-                    if not stream_started and waited > 30:
-                        # 30秒了，打印调试信息
-                        if idle_count % 50 == 0:
-                            raw_count = result.get("rawCount", 0)
-                            raw_sample = result.get("rawSample", [])
-                            print(f"  [{req_id}] ⏳ 等待中 waited={waited:.0f}s "
-                                  f"rawEvents={raw_count}")
-                            if raw_sample:
-                                for s in raw_sample:
-                                    print(f"    raw: {s[:150]}")
-
-                    if not stream_started and waited > 90:
-                        print(f"  [{req_id}] ⚠️ 90s 无网络数据，尝试 DOM")
-                        dom_text = await self._read_dom_response()
-                        if dom_text:
-                            full_text = dom_text
-                            yield dom_text
-                        else:
-                            yield "[错误] 响应超时"
-                        break
-
-                # 关闭捕获
-                try:
-                    await self.page.evaluate(
-                        "() => { window.__ds_capture_active = false; }"
-                    )
-                except Exception:
-                    pass
-
-                # 最终兜底
-                if not full_text:
-                    await asyncio.sleep(2)
-                    dom_text = await self._read_dom_response()
-                    if dom_text:
-                        print(f"  [{req_id}] 📋 最终 DOM 兜底，长度: {len(dom_text)}")
-                        yield dom_text
-                        full_text = dom_text
-
-                print(f"  [{req_id}] ✅ 完成，长度: {len(full_text)}")
-
-            except Exception as e:
-                try:
-                    await self.page.evaluate(
-                        "() => { window.__ds_capture_active = false; }"
-                    )
-                except Exception:
-                    pass
-                print(f"  [{req_id}] ❌ {e}")
-                import traceback
-                traceback.print_exc()
-                yield f"[错误] {str(e)}"
-
-    async def _read_dom_response(self) -> str:
-        """Selenium 思路：从最后一个对话项的 ds-markdown 读取文本"""
+        cp = None
         try:
-            text = await self.page.evaluate("""
-                () => {
-                    const items = document.querySelectorAll(
-                        'div[data-virtual-list-item-key]'
-                    );
-                    if (items.length > 0) {
-                        const last = items[items.length - 1];
-                        const md = last.querySelectorAll('[class*="ds-markdown"]');
-                        if (md.length > 0)
-                            return md[md.length - 1].textContent || '';
-                    }
-                    const allMd = document.querySelectorAll('[class*="ds-markdown"]');
-                    if (allMd.length > 0)
-                        return allMd[allMd.length - 1].textContent || '';
-                    return '';
-                }
-            """)
-            return (text or "").strip()
-        except Exception:
-            return ""
+            cp = await asyncio.wait_for(self._acquire_page(), timeout=300)
+        except asyncio.TimeoutError:
+            yield "[错误] 所有页面忙碌，请稍后重试"
+            return
+        except Exception as e:
+            yield f"[错误] {e}"
+            return
+
+        print(f"  [{req_id}] 分配到页面 #{cp.page_id}")
+
+        try:
+            cp.request_count += 1
+
+            # 检查页面存活
+            if not await cp.is_alive():
+                print(f"  [{req_id}] 页面 #{cp.page_id} 已死，恢复中...")
+                try:
+                    new_page = await self.context.new_page()
+                    await new_page.goto(
+                        "https://chat.deepseek.com/",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    await asyncio.sleep(2)
+                    cp.page = new_page
+                except Exception as e:
+                    yield f"[错误] 页面恢复失败: {e}"
+                    return
+
+            # 开启新对话
+            await cp.start_new_chat()
+            await asyncio.sleep(1)
+
+            # 输入并发送
+            await cp.type_and_send(message)
+            print(f"  [{req_id}] 等待回复...")
+
+            # ═══ DOM 通道：轮询等待 ═══
+            last_text = ""
+            stable_count = 0
+            max_wait_seconds = 600
+            response_started = False
+
+            for tick in range(max_wait_seconds * 2):  # 每 0.5s 一次
+                await asyncio.sleep(0.5)
+
+                try:
+                    state = await cp.get_response_state()
+                except Exception:
+                    continue
+
+                current_text = (state.get("text") or "").strip()
+                has_button = state.get("hasButton", False)
+                is_generating = state.get("isGenerating", False)
+
+                # 检测回复开始
+                if current_text and not response_started:
+                    response_started = True
+                    print(f"  [{req_id}] 回复开始 "
+                          f"(items={state.get('itemCount')})")
+
+                if response_started and current_text:
+                    # 有新增内容，流式输出
+                    if len(current_text) > len(last_text):
+                        new_part = current_text[len(last_text):]
+                        last_text = current_text
+                        stable_count = 0
+                        yield new_part
+                    elif current_text == last_text:
+                        stable_count += 1
+
+                    # 完成判定（三重保障）
+                    # 1. 复制按钮出现 + 不在生成 + 稳定3次
+                    if has_button and not is_generating and stable_count >= 3:
+                        print(f"  [{req_id}] ✅ 完成（复制按钮可用）")
+                        break
+
+                    # 2. 不在生成 + 有内容 + 稳定10次
+                    if (not is_generating and current_text
+                            and stable_count >= 10):
+                        print(f"  [{req_id}] ✅ 完成（生成停止+稳定）")
+                        break
+
+                    # 3. 文本30秒无变化
+                    if stable_count >= 60:
+                        print(f"  [{req_id}] ⏹️ 超时（30s无变化）")
+                        break
+
+                # 进度日志
+                if tick > 0 and tick % 20 == 0:
+                    print(
+                        f"  [{req_id}] ⏳ tick={tick} "
+                        f"len={len(current_text)} "
+                        f"gen={is_generating} "
+                        f"btn={has_button} "
+                        f"stable={stable_count}"
+                    )
+
+                # 完全没有回复的超时
+                if not response_started and tick > 120:  # 60秒
+                    print(f"  [{req_id}] ❌ 60秒无回复")
+                    yield "[错误] 等待回复超时"
+                    break
+
+            # ═══ 兜底 ═══
+            if not last_text:
+                fallback = await cp.read_dom_response()
+                if fallback:
+                    print(f"  [{req_id}] 📋 兜底获取: {len(fallback)}")
+                    yield fallback
+                    last_text = fallback
+                else:
+                    print(f"  [{req_id}] ❌ 完全无响应")
+                    try:
+                        ss = await self.take_screenshot_base64()
+                        if ss:
+                            print(f"  [{req_id}] 📸 截图已生成")
+                    except Exception:
+                        pass
+                    yield "抱歉，未能获取到响应。请稍后重试。"
+
+            print(f"  [{req_id}] 📊 页面#{cp.page_id} "
+                  f"完成，长度: {len(last_text)}")
+
+        except Exception as e:
+            print(f"  [{req_id}] ❌ {e}")
+            import traceback
+            traceback.print_exc()
+            yield f"[错误] {str(e)}"
+
+        finally:
+            if cp:
+                self._release_page(cp)
+
+    # ── 其他 ──
 
     async def is_alive(self) -> bool:
-        try:
-            if not self._ready or not self.page or self.page.is_closed():
-                return False
-            await self.page.evaluate("() => document.title")
-            return True
-        except Exception:
+        if not self._ready or not self._pages:
             return False
+        for cp in self._pages:
+            if await cp.is_alive():
+                return True
+        return False
 
     async def get_status(self) -> dict:
-        alive = await self.is_alive()
+        alive_count = 0
+        busy_count = 0
+        for cp in self._pages:
+            if await cp.is_alive():
+                alive_count += 1
+            if cp.busy:
+                busy_count += 1
+
         return {
-            "browser_alive": alive,
+            "browser_alive": alive_count > 0,
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "dual-channel",
+            "mode": "multi-page-dom",
             "has_token": True,
             "cookie_count": 0,
+            "page_count": len(self._pages),
+            "pages_alive": alive_count,
+            "pages_busy": busy_count,
+            "pages_idle": alive_count - busy_count,
             "uptime_seconds": time.time() - self.start_time,
             "heartbeat_count": self.heartbeat_count,
             "requests_handled": self.requests_handled,
             "total_requests": self.total_requests,
-            "current_url": (
-                self.page.url
-                if self.page and not self.page.is_closed()
-                else "N/A"
-            ),
             "timestamp": datetime.now().isoformat(),
         }
 
     async def take_screenshot_base64(self) -> Optional[str]:
-        try:
-            if not self.page or self.page.is_closed():
-                return None
-            buf = await self.page.screenshot(full_page=False)
-            return base64.b64encode(buf).decode("utf-8")
-        except Exception:
-            return None
+        for cp in self._pages:
+            try:
+                if not cp.page.is_closed():
+                    buf = await cp.page.screenshot(full_page=False)
+                    return base64.b64encode(buf).decode("utf-8")
+            except Exception:
+                continue
+        return None
 
     async def simulate_activity(self):
-        if not self.page or self.page.is_closed():
-            return
-        try:
-            self.heartbeat_count += 1
-            import random
-            await self.page.mouse.move(
-                random.randint(100, 1800), random.randint(100, 900)
+        self.heartbeat_count += 1
+        for cp in self._pages:
+            try:
+                if not cp.page.is_closed() and not cp.busy:
+                    import random
+                    await cp.page.mouse.move(
+                        random.randint(100, 1800),
+                        random.randint(100, 900),
+                    )
+                    await cp.page.evaluate("""
+                        () => {
+                            document.dispatchEvent(new MouseEvent(
+                                'mousemove', {
+                                    clientX: Math.random() * window.innerWidth,
+                                    clientY: Math.random() * window.innerHeight
+                                }
+                            ));
+                            window.scrollBy(0, Math.random() > 0.5 ? 1 : -1);
+                        }
+                    """)
+            except Exception:
+                pass
+        if self.heartbeat_count % 10 == 0:
+            alive = sum(
+                1 for cp in self._pages if not cp.page.is_closed()
             )
-            await self.page.evaluate("""
-                () => {
-                    document.dispatchEvent(new MouseEvent('mousemove', {
-                        clientX: Math.random() * window.innerWidth,
-                        clientY: Math.random() * window.innerHeight
-                    }));
-                    window.scrollBy(0, Math.random() > 0.5 ? 1 : -1);
-                }
-            """)
-            if self.heartbeat_count % 10 == 0:
-                print(f"💓 心跳 #{self.heartbeat_count}")
-        except Exception as e:
-            print(f"⚠️ 心跳异常: {e}")
+            busy = sum(1 for cp in self._pages if cp.busy)
+            print(f"💓 心跳 #{self.heartbeat_count} "
+                  f"({alive}存活/{busy}忙碌)")
 
     async def shutdown(self):
         try:
