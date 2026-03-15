@@ -3,7 +3,7 @@
 本地 Cookie 导出工具：
 1. 启动一个真实的浏览器窗口（有界面）
 2. 你手动登录 DeepSeek
-3. 登录成功后自动导出完整的认证数据并输出为单个环境变量
+3. 登录成功后自动导出完整的认证数据并输出为单个环境变量 DEEPSEEK_AUTH
 """
 
 import asyncio
@@ -54,7 +54,7 @@ async def main():
         for i in range(600):  # 最多等 10 分钟
             await asyncio.sleep(1)
             current_url = page.url
-            if ("sign_in" not in current_url and "login" not in current_url 
+            if ("sign_in" not in current_url and "login" not in current_url
                 and "chat.deepseek.com" in current_url):
                 print(f"🎉 检测到登录成功！当前页面: {current_url}")
                 logged_in = True
@@ -110,23 +110,38 @@ async def main():
             "url_after_login": page.url,
         }
 
-        # 保存到文件（可选）
+        # 保存到本地文件（方便调试）
         output_file = Path("deepseek_auth.json")
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(auth_data, f, ensure_ascii=False, indent=2)
         print(f"\n✅ 认证数据已保存到: {output_file.absolute()}")
 
-        # ====== 修改点：输出单个环境变量 ======
+        # ====== 核心输出：单个环境变量 DEEPSEEK_AUTH ======
         auth_json_str = json.dumps(auth_data, ensure_ascii=False, separators=(',', ':'))
 
         print("\n" + "=" * 60)
-        print("  以下是单个环境变量格式，可直接粘贴到 HuggingFace Secrets")
+        print("  复制下面的 JSON 值，粘贴到 HuggingFace Secrets 中")
+        print("  变量名: DEEPSEEK_AUTH")
         print("=" * 60)
-        print(f"\nDEEPSEEK_AUTH={auth_json_str}")
-        print("\n" + "=" * 60)
+        print()
+        print("--- DEEPSEEK_AUTH 值开始 (下一行开始复制) ---")
+        print(auth_json_str)
+        print("--- DEEPSEEK_AUTH 值结束 (上一行结束复制) ---")
+        print()
+        print(f"📏 值的长度: {len(auth_json_str)} 字符")
+        print()
+
+        # 同时输出 shell export 格式（方便本地测试）
+        print("=" * 60)
+        print("  如需本地测试，可以用下面的 export 命令：")
+        print("=" * 60)
+        # 对单引号转义
+        escaped = auth_json_str.replace("'", "'\\''")
+        print(f"\nexport DEEPSEEK_AUTH='{escaped}'")
+        print()
 
         # 可选：显示关键信息
-        print("\n🔍 关键 Cookie 列表：")
+        print("🔍 关键 Cookie 列表：")
         for c in ds_cookies:
             expires_info = ""
             if c.get("expires", -1) > 0:
@@ -146,6 +161,11 @@ async def main():
 
         await browser.close()
         print("\n✅ 浏览器已关闭。认证数据导出完成！")
+        print("\n💡 使用方式：")
+        print("   1. 在 HuggingFace Space → Settings → Secrets")
+        print("   2. 新建 Secret，Name 填: DEEPSEEK_AUTH")
+        print("   3. Value 粘贴上面输出的 JSON 字符串")
+        print("   4. 另外新建 Secret，Name 填: API_SECRET_KEY，Value 填你想要的 API 密钥")
 
 
 if __name__ == "__main__":
