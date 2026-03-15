@@ -1,10 +1,10 @@
 # browser_manager.py
 """
-DeepSeek 反代（路由拦截模式）
-- 用 Playwright route API 做中间人，拦截所有 /chat/completion 请求
-- 读取真实响应后同时转发给页面和推入队列
-- 不依赖 fetch monkey-patch，不受 Worker/XHR/EventSource 限制
-- PoW 由浏览器自己处理
+DeepSeek 反代（初始化脚本拦截模式）
+- 用 addInitScript 在页面最早期 patch fetch/XMLHttpRequest
+- 真正逐 chunk 实时读取 SSE，不等完整响应
+- 敏感内容在被替换前就已经捕获
+- 适配 DeepSeek 自有 SSE 格式（fragments）
 """
 
 import os
@@ -19,6 +19,227 @@ from datetime import datetime
 from typing import AsyncGenerator, Optional
 
 from auth_handler import AuthHandler
+
+
+# 注入到页面最早期的 JS 脚本
+INIT_INTERCEPT_SCRIPT = """
+(() => {
+    // 防止重复注入
+    if (window.__ds_interceptor_installed) return;
+    window.__ds_interceptor_installed = true;
+
+    // 全局捕获存储
+    window.__ds_chunks = [];
+    window.__ds_stream_done = false;
+    window.__ds_stream_error = null;
+    window.__ds_capture_active = false;
+
+    // 重置函数
+    window.__ds_reset = () => {
+        window.__ds_chunks = [];
+        window.__ds_stream_done = false;
+        window.__ds_stream_error = null;
+    };
+
+    // 解析 SSE 行，支持 DeepSeek 自有格式和 OpenAI 格式
+    function parseSSELine(line) {
+        line = line.trim();
+        if (!line.startsWith('data: ')) return null;
+        const dataStr = line.substring(6).trim();
+
+        if (dataStr === '[DONE]') return { type: 'done' };
+
+        try {
+            const parsed = JSON.parse(dataStr);
+
+            // DeepSeek 自有格式：v.response.fragments[].content
+            if (parsed.v && parsed.v.response) {
+                const resp = parsed.v.response;
+                const fragments = resp.fragments || [];
+                let text = '';
+                for (const frag of fragments) {
+                    if (frag.content) text += frag.content;
+                }
+                if (text) return { type: 'content', data: text, format: 'deepseek' };
+            }
+
+            // OpenAI 格式：choices[0].delta.content
+            if (parsed.choices && parsed.choices.length > 0) {
+                const delta = parsed.choices[0].delta || {};
+                if (delta.content) return { type: 'content', data: delta.content, format: 'openai' };
+            }
+
+            return null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // 处理 SSE 流的通用函数
+    async function processSSEStream(reader) {
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let lastFullText = '';
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\\n');
+                buffer = lines.pop(); // 保留不完整行
+
+                for (const line of lines) {
+                    const result = parseSSELine(line);
+                    if (!result) continue;
+
+                    if (result.type === 'done') {
+                        window.__ds_stream_done = true;
+                        return;
+                    }
+
+                    if (result.type === 'content') {
+                        if (result.format === 'deepseek') {
+                            // DeepSeek 格式：每次推送的是完整累积文本
+                            // 我们只取增量部分
+                            const fullText = result.data;
+                            if (fullText.length > lastFullText.length) {
+                                const delta = fullText.substring(lastFullText.length);
+                                window.__ds_chunks.push(delta);
+                                lastFullText = fullText;
+                            } else if (fullText !== lastFullText) {
+                                // 文本被替换了（敏感内容审查），记录完整的新文本
+                                window.__ds_chunks.push('[CONTENT_REPLACED]');
+                                lastFullText = fullText;
+                            }
+                        } else {
+                            // OpenAI 格式：每次是增量
+                            window.__ds_chunks.push(result.data);
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            window.__ds_stream_error = e.message;
+        }
+        window.__ds_stream_done = true;
+    }
+
+    // ══════════ 拦截 fetch ══════════
+    const _originalFetch = window.fetch;
+    window.fetch = async function(...args) {
+        const response = await _originalFetch.apply(this, args);
+        const url = (typeof args[0] === 'string') ? args[0] : (args[0]?.url || '');
+
+        if (window.__ds_capture_active && url.includes('/chat/completion')) {
+            const contentType = response.headers.get('content-type') || '';
+            if (contentType.includes('text/event-stream') || contentType.includes('application/json')) {
+                console.log('[DS Intercept] 捕获到 completion 响应');
+                // clone 出来读取，原始返回给页面
+                const cloned = response.clone();
+                const reader = cloned.body.getReader();
+                processSSEStream(reader);
+            }
+        }
+        return response;
+    };
+
+    // ══════════ 拦截 XMLHttpRequest ══════════
+    const _originalXHROpen = XMLHttpRequest.prototype.open;
+    const _originalXHRSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__ds_url = url;
+        return _originalXHROpen.call(this, method, url, ...rest);
+    };
+
+    XMLHttpRequest.prototype.send = function(body) {
+        if (window.__ds_capture_active && this.__ds_url && this.__ds_url.includes('/chat/completion')) {
+            console.log('[DS Intercept] XHR 捕获到 completion 请求');
+            let xhrBuffer = '';
+            let xhrLastFullText = '';
+
+            this.addEventListener('progress', function() {
+                try {
+                    const text = this.responseText || '';
+                    const newData = text.substring(xhrBuffer.length);
+                    xhrBuffer = text;
+
+                    const lines = newData.split('\\n');
+                    for (const line of lines) {
+                        const result = parseSSELine(line);
+                        if (!result) continue;
+
+                        if (result.type === 'done') {
+                            window.__ds_stream_done = true;
+                            return;
+                        }
+
+                        if (result.type === 'content') {
+                            if (result.format === 'deepseek') {
+                                const fullText = result.data;
+                                if (fullText.length > xhrLastFullText.length) {
+                                    window.__ds_chunks.push(fullText.substring(xhrLastFullText.length));
+                                    xhrLastFullText = fullText;
+                                }
+                            } else {
+                                window.__ds_chunks.push(result.data);
+                            }
+                        }
+                    }
+                } catch (e) {}
+            });
+
+            this.addEventListener('loadend', function() {
+                window.__ds_stream_done = true;
+            });
+
+            this.addEventListener('error', function() {
+                window.__ds_stream_error = 'XHR error';
+                window.__ds_stream_done = true;
+            });
+        }
+        return _originalXHRSend.call(this, body);
+    };
+
+    // ══════════ 拦截 EventSource ══════════
+    const _OriginalEventSource = window.EventSource;
+    if (_OriginalEventSource) {
+        window.EventSource = function(url, config) {
+            const es = new _OriginalEventSource(url, config);
+            if (window.__ds_capture_active && url.includes('/chat/completion')) {
+                console.log('[DS Intercept] EventSource 捕获');
+                let esLastFullText = '';
+
+                es.addEventListener('message', function(event) {
+                    const result = parseSSELine('data: ' + event.data);
+                    if (!result) return;
+                    if (result.type === 'done') { window.__ds_stream_done = true; return; }
+                    if (result.type === 'content') {
+                        if (result.format === 'deepseek') {
+                            if (result.data.length > esLastFullText.length) {
+                                window.__ds_chunks.push(result.data.substring(esLastFullText.length));
+                                esLastFullText = result.data;
+                            }
+                        } else {
+                            window.__ds_chunks.push(result.data);
+                        }
+                    }
+                });
+                es.addEventListener('error', () => { window.__ds_stream_done = true; });
+            }
+            return es;
+        };
+        window.EventSource.prototype = _OriginalEventSource.prototype;
+        Object.defineProperty(window.EventSource, 'CONNECTING', { value: 0 });
+        Object.defineProperty(window.EventSource, 'OPEN', { value: 1 });
+        Object.defineProperty(window.EventSource, 'CLOSED', { value: 2 });
+    }
+
+    console.log('[DS Intercept] 全协议拦截器已安装 (fetch + XHR + EventSource)');
+})();
+"""
 
 
 class BrowserManager:
@@ -41,10 +262,6 @@ class BrowserManager:
         self._lock = asyncio.Lock()
         self._ready = False
         self._ready_event = asyncio.Event()
-
-        # SSE 捕获
-        self._sse_queue: asyncio.Queue = None
-        self._capture_active = False
 
     # ── 就绪控制 ──
 
@@ -125,12 +342,9 @@ class BrowserManager:
         else:
             print("🎉 登录成功！")
 
-        # 注册路由拦截器
-        await self._setup_route_interceptor()
-
         self._ready = True
         self._ready_event.set()
-        print(f"✅ 就绪（引擎: {self._engine}，模式: 路由拦截）")
+        print(f"✅ 就绪（引擎: {self._engine}，模式: 初始化脚本拦截）")
 
     async def _start_with_camoufox(self):
         print("  → Camoufox...")
@@ -142,8 +356,10 @@ class BrowserManager:
             locale="zh-CN",
             timezone_id="Asia/Shanghai",
         )
+        # 在创建页面之前就注入拦截脚本
+        await self.context.add_init_script(INIT_INTERCEPT_SCRIPT)
         self.page = await self.context.new_page()
-        print("  ✅ Camoufox 已启动")
+        print("  ✅ Camoufox 已启动（拦截器已预注入）")
 
     async def _start_with_playwright(self):
         print("  → Playwright Firefox...")
@@ -173,8 +389,10 @@ class BrowserManager:
                 "Gecko/20100101 Firefox/126.0"
             ),
         )
+        # 在创建页面之前就注入拦截脚本
+        await self.context.add_init_script(INIT_INTERCEPT_SCRIPT)
         self.page = await self.context.new_page()
-        print("  ✅ Playwright Firefox 已启动")
+        print("  ✅ Playwright Firefox 已启动（拦截器已预注入）")
 
     async def _inject_stealth_scripts(self):
         if self._engine == "camoufox":
@@ -190,113 +408,20 @@ class BrowserManager:
                 });
             """)
 
-    # ══════════════════════════════════════════════════════
-    # 核心：Playwright route 拦截器
-    # ══════════════════════════════════════════════════════
-
-    async def _setup_route_interceptor(self):
-        """
-        用 page.route 拦截 /chat/completion 请求。
-        拿到真实响应后：
-        1. 解析 SSE 内容推入队列
-        2. 把完整响应原样转发回页面（页面正常工作）
-        """
-        async def handle_completion_route(route):
-            """拦截 /chat/completion 请求"""
-            if not self._capture_active:
-                # 不在捕获模式，直接放行
-                await route.continue_()
-                return
-
-            print("  🎯 拦截到 /chat/completion 请求")
-
+    async def _ensure_interceptor_active(self):
+        """确保拦截器在当前页面中仍然有效"""
+        try:
+            installed = await self.page.evaluate(
+                "() => window.__ds_interceptor_installed === true"
+            )
+            if not installed:
+                print("  ⚠️ 拦截器丢失，重新注入...")
+                await self.page.evaluate(INIT_INTERCEPT_SCRIPT)
+        except Exception:
             try:
-                # 获取真实响应
-                response = await route.fetch()
-                status = response.status
-                headers = response.headers
-                body_bytes = await response.body()
-
-                # 把响应原样返回给页面
-                await route.fulfill(
-                    status=status,
-                    headers=headers,
-                    body=body_bytes,
-                )
-
-                # 同时解析 SSE 内容推入队列
-                if status == 200 and self._sse_queue:
-                    body_text = body_bytes.decode("utf-8", errors="replace")
-                    self._parse_sse_to_queue(body_text)
-                elif self._sse_queue:
-                    body_text = body_bytes.decode("utf-8", errors="replace")
-                    print(f"  ⚠️ 响应状态码: {status}, body: {body_text[:200]}")
-                    await self._sse_queue.put({
-                        "type": "error",
-                        "data": f"HTTP {status}: {body_text[:500]}"
-                    })
-                    await self._sse_queue.put({"type": "done"})
-
+                await self.page.evaluate(INIT_INTERCEPT_SCRIPT)
             except Exception as e:
-                print(f"  ❌ 路由拦截异常: {e}")
-                # 出错时放行原始请求，避免页面卡死
-                try:
-                    await route.continue_()
-                except Exception:
-                    pass
-                if self._sse_queue:
-                    await self._sse_queue.put({
-                        "type": "error",
-                        "data": str(e)
-                    })
-                    await self._sse_queue.put({"type": "done"})
-
-        # 注册路由：匹配所有包含 /chat/completion 的 URL
-        await self.page.route("**/chat/completion*", handle_completion_route)
-        print("  🔌 路由拦截器已注册")
-
-    def _parse_sse_to_queue(self, body: str):
-        """解析 SSE 文本，把内容逐条推入队列"""
-        if not self._sse_queue:
-            return
-
-        lines = body.split("\n")
-        has_content = False
-
-        for line in lines:
-            line = line.strip()
-            if not line.startswith("data: "):
-                continue
-
-            data_str = line[6:].strip()
-
-            if data_str == "[DONE]":
-                asyncio.ensure_future(self._sse_queue.put({"type": "done"}))
-                return
-
-            try:
-                parsed = json.loads(data_str)
-                choices = parsed.get("choices", [])
-                if choices:
-                    delta = choices[0].get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        has_content = True
-                        asyncio.ensure_future(
-                            self._sse_queue.put({
-                                "type": "content",
-                                "data": content
-                            })
-                        )
-            except json.JSONDecodeError:
-                pass
-
-        # 兜底：确保队列一定有结束信号
-        asyncio.ensure_future(self._sse_queue.put({"type": "done"}))
-
-        if not has_content:
-            print(f"  ⚠️ SSE 解析完成但无内容，body 长度: {len(body)}")
-            print(f"  ⚠️ body 预览: {body[:500]}")
+                print(f"  ❌ 重新注入拦截器失败: {e}")
 
     # ── 新对话 ──
 
@@ -407,108 +532,131 @@ class BrowserManager:
                 await self._start_new_chat()
                 await asyncio.sleep(1)
 
-                # 准备队列，开启捕获
-                self._sse_queue = asyncio.Queue()
-                self._capture_active = True
+                # 确保拦截器有效
+                await self._ensure_interceptor_active()
+
+                # 重置捕获状态 + 开启捕获
+                await self.page.evaluate("""
+                    () => {
+                        window.__ds_reset();
+                        window.__ds_capture_active = true;
+                    }
+                """)
 
                 # 发送消息
                 await self._type_and_send(message)
 
-                # ── 从队列读取 SSE 数据 ──
+                # ── 实时轮询读取 ──
                 print(f"  [{req_id}] 等待 SSE 流...")
                 full_text = ""
+                read_index = 0
                 max_wait = 600.0
+                waited = 0.0
+                idle_count = 0
                 stream_started = False
 
-                while True:
-                    try:
-                        # 等待队列中的消息，超时则检查状态
-                        msg = await asyncio.wait_for(
-                            self._sse_queue.get(),
-                            timeout=120.0 if not stream_started else 60.0
-                        )
-                    except asyncio.TimeoutError:
-                        if not stream_started:
-                            print(f"  [{req_id}] ⚠️ 120秒未收到 SSE 数据")
-                            # DOM 兜底
-                            fallback = await self._dom_fallback()
-                            if fallback:
-                                print(f"  [{req_id}] 🔄 DOM 兜底成功，长度: {len(fallback)}")
-                                yield fallback
-                                full_text = fallback
-                            else:
-                                yield "[错误] 等待响应超时，请重试"
-                        else:
-                            print(f"  [{req_id}] ⚠️ 流中断（60秒无新数据）")
+                while waited < max_wait:
+                    result = await self.page.evaluate("""
+                        (fromIndex) => ({
+                            chunks: window.__ds_chunks.slice(fromIndex),
+                            total: window.__ds_chunks.length,
+                            done: window.__ds_stream_done,
+                            error: window.__ds_stream_error,
+                        })
+                    """, read_index)
+
+                    if result.get("error"):
+                        err = result["error"]
+                        print(f"  [{req_id}] ❌ 流错误: {err}")
+                        if not full_text:
+                            yield f"[错误] {err}"
                         break
 
-                    if msg["type"] == "content":
+                    new_chunks = result.get("chunks", [])
+                    if new_chunks:
                         if not stream_started:
                             stream_started = True
                             print(f"  [{req_id}] 流开始")
-                        full_text += msg["data"]
-                        yield msg["data"]
 
-                    elif msg["type"] == "done":
+                        for chunk in new_chunks:
+                            if chunk == '[CONTENT_REPLACED]':
+                                print(f"  [{req_id}] ⚠️ 检测到内容被替换（审查）")
+                                continue
+                            full_text += chunk
+                            yield chunk
+                        read_index += len(new_chunks)
+                        idle_count = 0
+
+                    if result.get("done"):
+                        if not new_chunks:
+                            break
+                        continue
+
+                    if not new_chunks:
+                        idle_count += 1
+
+                    sleep_time = 0.05 if idle_count < 50 else 0.2
+                    await asyncio.sleep(sleep_time)
+                    waited += sleep_time
+
+                    # 超时检查
+                    if not stream_started and waited > 90:
+                        print(f"  [{req_id}] ⚠️ 90秒未收到流数据，尝试 DOM 兜底")
+                        fallback = await self._dom_fallback()
+                        if fallback:
+                            yield fallback
+                            full_text = fallback
+                        else:
+                            yield "[错误] 等待响应超时"
                         break
 
-                    elif msg["type"] == "error":
-                        err = msg["data"]
-                        print(f"  [{req_id}] ❌ SSE 错误: {err}")
-                        if not full_text:
-                            # 尝试 DOM 兜底
-                            fallback = await self._dom_fallback()
-                            if fallback:
-                                yield fallback
-                                full_text = fallback
-                            else:
-                                yield f"[错误] {err}"
-                        break
+                    if idle_count > 0 and idle_count % 200 == 0:
+                        print(f"  [{req_id}] ⏳ idle={idle_count}, waited={waited:.0f}s")
 
                 # 关闭捕获
-                self._capture_active = False
-                self._sse_queue = None
+                await self.page.evaluate(
+                    "() => { window.__ds_capture_active = false; }"
+                )
 
-                # 如果完全没内容，最终 DOM 兜底
+                # 最终兜底
                 if not full_text:
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(2)
                     fallback = await self._dom_fallback()
                     if fallback:
-                        print(f"  [{req_id}] 🔄 最终 DOM 兜底，长度: {len(fallback)}")
+                        print(f"  [{req_id}] 🔄 DOM 兜底，长度: {len(fallback)}")
                         yield fallback
                         full_text = fallback
 
                 print(f"  [{req_id}] ✅ 完成，长度: {len(full_text)}")
 
             except Exception as e:
-                self._capture_active = False
-                self._sse_queue = None
+                try:
+                    await self.page.evaluate(
+                        "() => { window.__ds_capture_active = false; }"
+                    )
+                except Exception:
+                    pass
                 print(f"  [{req_id}] ❌ {e}")
                 import traceback
                 traceback.print_exc()
                 yield f"[错误] {str(e)}"
 
     async def _dom_fallback(self) -> str:
-        """DOM 兜底"""
         try:
             text = await self.page.evaluate("""
                 () => {
-                    // 方法1: DeepSeek 虚拟列表
                     const items = document.querySelectorAll(
                         'div[data-virtual-list-item-key]'
                     );
                     if (items.length > 0) {
                         const last = items[items.length - 1];
                         const md = last.querySelectorAll('[class*="ds-markdown"]');
-                        if (md.length > 0) {
+                        if (md.length > 0)
                             return md[md.length - 1].textContent || '';
-                        }
                     }
-                    // 方法2: 通用
                     const allMd = document.querySelectorAll('[class*="ds-markdown"]');
-                    if (allMd.length > 0) {
+                    if (allMd.length > 0)
                         return allMd[allMd.length - 1].textContent || '';
-                    }
                     return '';
                 }
             """)
@@ -534,7 +682,7 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "route-intercept",
+            "mode": "init-script-intercept",
             "has_token": True,
             "cookie_count": 0,
             "uptime_seconds": time.time() - self.start_time,
