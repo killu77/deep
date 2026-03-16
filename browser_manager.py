@@ -13,7 +13,6 @@ from typing import AsyncGenerator, Optional
 
 from auth_handler import AuthHandler
 
-# 审查替换的固定提示语列表
 CENSORSHIP_PHRASES = [
     "这个问题我暂时无法回答",
     "让我们换个话题再聊聊吧",
@@ -26,132 +25,207 @@ CENSORSHIP_PHRASES = [
     "很抱歉，这个问题",
 ]
 
+
+def _is_censored(text: str) -> bool:
+    text = text.strip()
+    if not text:
+        return False
+    for phrase in CENSORSHIP_PHRASES:
+        if phrase in text:
+            if len(text) < 150:
+                return True
+    return False
+
+
 # ============================================================
-# 精简后的 JS：合并读取文本 + 状态检测为一次调用
+# 注入到页面的 JS：拦截 DOM 变化，保护原始文本不被审查替换
 # ============================================================
-CHECK_STATE_JS = """
-() => {
-    const result = {
-        hasButton: false,
+INJECTED_MONITOR_SCRIPT = """
+(() => {
+    if (window.__dsMonitorInstalled) return;
+    window.__dsMonitorInstalled = true;
+
+    // 存储最佳文本（最长的非审查文本）
+    window.__dsState = {
+        bestText: '',
+        currentText: '',
         isGenerating: false,
-        text: '',
+        hasButton: false,
         itemCount: 0,
-        hasThinking: false,
-        thinkingDone: false,
+        lastUpdateTime: 0,
+        generationStarted: false,
+        finished: false,
+        chunks: [],         // 增量文本队列
+        lastYieldedLen: 0,  // 已推送的长度
     };
 
-    const items = document.querySelectorAll('div[data-virtual-list-item-key]');
-    result.itemCount = items.length;
-    if (items.length === 0) return result;
+    const CENSOR_PHRASES = %CENSOR_PHRASES%;
 
-    const lastItem = items[items.length - 1];
+    function isCensored(text) {
+        if (!text || text.length > 150) return false;
+        return CENSOR_PHRASES.some(p => text.includes(p));
+    }
 
-    // —— 提取回复正文（排除思考区域）——
-    const allMd = lastItem.querySelectorAll('[class*="ds-markdown"]');
-    if (allMd.length > 0) {
-        // 收集 think 容器
-        const thinkSels = [
+    function readReplyText() {
+        const items = document.querySelectorAll('div[data-virtual-list-item-key]');
+        if (!items.length) return '';
+        const lastItem = items[items.length - 1];
+
+        const allMd = lastItem.querySelectorAll('[class*="ds-markdown"]');
+        if (!allMd.length) return '';
+
+        const thinkSelectors = [
             '[class*="think"]', '[class*="Think"]', '[class*="thought"]',
-            '[class*="reasoning"]', '[class*="collapse"]', '[class*="Collapse"]',
-            'details'
+            '[class*="reasoning"]', '[class*="_74c0879"]',
+            '[class*="collapse"]', '[class*="Collapse"]', 'details',
         ];
-        const thinkSet = new Set();
-        for (const sel of thinkSels) {
-            lastItem.querySelectorAll(sel).forEach(el => thinkSet.add(el));
-        }
-
-        if (thinkSet.size > 0) {
-            result.hasThinking = true;
-            // 检查思考区域是否已收起/完成（有 summary 或者有折叠标记）
-            for (const tc of thinkSet) {
-                if (tc.querySelector('summary') ||
-                    tc.getAttribute('aria-expanded') === 'false' ||
-                    tc.classList.toString().includes('ollaps')) {
-                    result.thinkingDone = true;
-                    break;
-                }
-            }
-        }
+        const thinkContainers = [];
+        thinkSelectors.forEach(sel => {
+            lastItem.querySelectorAll(sel).forEach(el => thinkContainers.push(el));
+        });
 
         const replyMds = [];
         for (const md of allMd) {
-            let insideThink = false;
-            for (const tc of thinkSet) {
-                if (tc.contains(md) && tc !== md) {
-                    insideThink = true;
-                    break;
-                }
+            let inside = false;
+            for (const tc of thinkContainers) {
+                if (tc.contains(md) && tc !== md) { inside = true; break; }
             }
-            if (!insideThink) replyMds.push(md);
+            if (!inside) replyMds.push(md);
         }
 
         if (replyMds.length > 0) {
-            result.text = replyMds[replyMds.length - 1].innerText || '';
-        } else if (allMd.length > 0) {
-            result.text = allMd[allMd.length - 1].innerText || '';
+            return replyMds[replyMds.length - 1].innerText || '';
         }
+        return allMd[allMd.length - 1].innerText || '';
     }
 
-    // —— 复制/重试按钮 ——
-    const buttons = lastItem.querySelectorAll('div[role="button"]');
-    result.hasButton = buttons.length > 0;
+    function checkState() {
+        const items = document.querySelectorAll('div[data-virtual-list-item-key]');
+        const itemCount = items.length;
+        const stopBtn = document.querySelector('[class*="stop"], [class*="square"]');
+        const isGenerating = !!stopBtn && stopBtn.offsetParent !== null;
 
-    // —— 是否正在生成：查找停止按钮（更精确的选择器）——
-    // DeepSeek 的停止按钮通常有特定的 SVG 或者 aria-label
-    const stopSelectors = [
-        'button[aria-label*="stop"]',
-        'button[aria-label*="Stop"]',
-        'button[aria-label*="停止"]',
-        '[class*="stop-button"]',
-        '[class*="stopButton"]',
-    ];
-
-    let foundStop = false;
-    for (const sel of stopSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.offsetParent !== null) {
-            foundStop = true;
-            break;
+        let hasButton = false;
+        if (items.length > 0) {
+            const lastItem = items[items.length - 1];
+            hasButton = lastItem.querySelectorAll('div[role="button"]').length > 0;
         }
-    }
 
-    // 备用检测：通过动画元素判断（加载动画/光标闪烁）
-    if (!foundStop) {
-        const loadingIndicators = lastItem.querySelectorAll(
-            '[class*="loading"], [class*="cursor"], [class*="blink"], ' +
-            '[class*="typing"], [class*="generating"]'
-        );
-        for (const el of loadingIndicators) {
-            if (el.offsetParent !== null) {
-                foundStop = true;
-                break;
+        const text = readReplyText().trim();
+
+        const s = window.__dsState;
+        s.isGenerating = isGenerating;
+        s.hasButton = hasButton;
+        s.itemCount = itemCount;
+        s.currentText = text;
+
+        if (isGenerating && !s.generationStarted) {
+            s.generationStarted = true;
+        }
+
+        // 审查检测：如果之前有长文本，突然变短且是审查文本
+        if (text && s.bestText.length > 50 &&
+            text.length < s.bestText.length * 0.5 && isCensored(text)) {
+            // 被审查了，不更新 bestText，标记完成
+            s.finished = true;
+            // 把 bestText 中未推送的部分加入 chunks
+            if (s.lastYieldedLen < s.bestText.length) {
+                s.chunks.push(s.bestText.substring(s.lastYieldedLen));
+                s.lastYieldedLen = s.bestText.length;
+            }
+            return;
+        }
+
+        // 更新最佳文本
+        if (text && text.length >= s.bestText.length) {
+            s.bestText = text;
+        }
+
+        // 推送增量
+        if (text.length > s.lastYieldedLen) {
+            // 只在生成中或还没出现按钮时推送（避免推送审查文本）
+            if (isGenerating || (!hasButton && s.generationStarted) || !isCensored(text)) {
+                const newPart = text.substring(s.lastYieldedLen);
+                s.chunks.push(newPart);
+                s.lastYieldedLen = text.length;
             }
         }
-    }
 
-    // 再备用：检查整个页面底部的停止/方块按钮区域
-    if (!foundStop) {
-        // 只在输入框附近查找，避免误匹配
-        const inputArea = document.querySelector('textarea')?.parentElement?.parentElement?.parentElement;
-        if (inputArea) {
-            const btns = inputArea.querySelectorAll('div[role="button"], button');
-            for (const btn of btns) {
-                const svg = btn.querySelector('svg');
-                if (svg && btn.offsetParent !== null) {
-                    const rect = svg.querySelector('rect');
-                    if (rect) {
-                        foundStop = true;
-                        break;
-                    }
+        s.lastUpdateTime = Date.now();
+
+        // 完成检测
+        if (hasButton && !isGenerating && s.generationStarted) {
+            if (isCensored(text) && s.bestText.length > text.length * 1.5) {
+                // 审查替换，用快照
+                if (s.lastYieldedLen < s.bestText.length) {
+                    s.chunks.push(s.bestText.substring(s.lastYieldedLen));
+                    s.lastYieldedLen = s.bestText.length;
+                }
+            } else {
+                if (text.length > s.lastYieldedLen) {
+                    s.chunks.push(text.substring(s.lastYieldedLen));
+                    s.lastYieldedLen = text.length;
                 }
             }
+            s.finished = true;
         }
     }
 
-    result.isGenerating = foundStop;
-    return result;
-}
-"""
+    // 用 MutationObserver 监听 DOM 变化，比轮询更快
+    const observer = new MutationObserver(() => {
+        try { checkState(); } catch(e) {}
+    });
+
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+    });
+
+    // 同时保留一个低频轮询作为兜底
+    setInterval(() => {
+        try { checkState(); } catch(e) {}
+    }, 200);
+
+    // 暴露重置方法（每次新请求前调用）
+    window.__dsResetMonitor = () => {
+        window.__dsState = {
+            bestText: '',
+            currentText: '',
+            isGenerating: false,
+            hasButton: false,
+            itemCount: 0,
+            lastUpdateTime: 0,
+            generationStarted: false,
+            finished: false,
+            chunks: [],
+            lastYieldedLen: 0,
+        };
+    };
+
+    // 暴露获取增量的方法（Python 调用后清空队列）
+    window.__dsFlushChunks = () => {
+        const s = window.__dsState;
+        const data = {
+            chunks: s.chunks.splice(0),  // 取出并清空
+            finished: s.finished,
+            isGenerating: s.isGenerating,
+            hasButton: s.hasButton,
+            bestLen: s.bestText.length,
+            currentLen: s.currentText.length,
+            yieldedLen: s.lastYieldedLen,
+            itemCount: s.itemCount,
+            generationStarted: s.generationStarted,
+        };
+        return data;
+    };
+
+    // 暴露获取完整最佳文本的方法
+    window.__dsGetBestText = () => {
+        return window.__dsState.bestText;
+    };
+})();
+""".replace('%CENSOR_PHRASES%', json.dumps(CENSORSHIP_PHRASES, ensure_ascii=False))
 
 
 class ChatPage:
@@ -161,6 +235,45 @@ class ChatPage:
         self.busy = False
         self.request_count = 0
         self.last_used = 0.0
+        self._monitor_injected = False
+
+    async def ensure_monitor(self):
+        """确保监控脚本已注入"""
+        if self._monitor_injected:
+            # 验证脚本是否还在（页面可能刷新过）
+            try:
+                installed = await self.page.evaluate("() => !!window.__dsMonitorInstalled")
+                if installed:
+                    return
+            except Exception:
+                pass
+        try:
+            await self.page.evaluate(INJECTED_MONITOR_SCRIPT)
+            self._monitor_injected = True
+        except Exception as e:
+            print(f"  ⚠️ 监控脚本注入失败: {e}")
+
+    async def reset_monitor(self):
+        """重置监控状态（新请求前调用）"""
+        try:
+            await self.page.evaluate("() => { if(window.__dsResetMonitor) window.__dsResetMonitor(); }")
+        except Exception:
+            pass
+
+    async def flush_chunks(self) -> dict:
+        """获取增量文本块"""
+        try:
+            return await self.page.evaluate("() => window.__dsFlushChunks ? window.__dsFlushChunks() : null")
+        except Exception:
+            return None
+
+    async def get_best_text(self) -> str:
+        """获取最佳快照文本"""
+        try:
+            text = await self.page.evaluate("() => window.__dsGetBestText ? window.__dsGetBestText() : ''")
+            return (text or "").strip()
+        except Exception:
+            return ""
 
     async def start_new_chat(self):
         if "chat.deepseek.com" not in self.page.url:
@@ -170,6 +283,8 @@ class ChatPage:
                 timeout=30000,
             )
             await asyncio.sleep(2)
+            self._monitor_injected = False
+            return
 
         for sel in [
             "xpath=//*[contains(text(), '开启新对话')]",
@@ -193,13 +308,12 @@ class ChatPage:
             timeout=30000,
         )
         await asyncio.sleep(3)
+        self._monitor_injected = False
 
     async def get_conversation_item_count(self) -> int:
         try:
             return await self.page.evaluate("""
-                () => document.querySelectorAll(
-                    'div[data-virtual-list-item-key]'
-                ).length
+                () => document.querySelectorAll('div[data-virtual-list-item-key]').length
             """)
         except Exception:
             return 0
@@ -213,7 +327,7 @@ class ChatPage:
         ).first
         await textarea.wait_for(state="visible", timeout=10000)
         await textarea.click()
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
 
         try:
             await textarea.fill("")
@@ -238,19 +352,81 @@ class ChatPage:
                 }
             """, message)
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
         await textarea.press("Enter")
-        await asyncio.sleep(1)
-
-    async def check_generation_state(self) -> dict:
-        return await self.page.evaluate(CHECK_STATE_JS)
+        await asyncio.sleep(0.5)
 
     async def read_response_text(self) -> str:
         try:
-            state = await self.check_generation_state()
-            return (state.get("text") or "").strip()
+            text = await self.page.evaluate("""
+                () => {
+                    const items = document.querySelectorAll('div[data-virtual-list-item-key]');
+                    if (!items.length) return '';
+                    const lastItem = items[items.length - 1];
+                    const allMd = lastItem.querySelectorAll('[class*="ds-markdown"]');
+                    if (!allMd.length) return '';
+
+                    const thinkSelectors = [
+                        '[class*="think"]','[class*="Think"]','[class*="thought"]',
+                        '[class*="reasoning"]','[class*="_74c0879"]',
+                        '[class*="collapse"]','[class*="Collapse"]','details',
+                    ];
+                    const thinkContainers = [];
+                    thinkSelectors.forEach(sel => {
+                        lastItem.querySelectorAll(sel).forEach(el => thinkContainers.push(el));
+                    });
+                    const replyMds = [];
+                    for (const md of allMd) {
+                        let inside = false;
+                        for (const tc of thinkContainers) {
+                            if (tc.contains(md) && tc !== md) { inside = true; break; }
+                        }
+                        if (!inside) replyMds.push(md);
+                    }
+                    if (replyMds.length > 0) return replyMds[replyMds.length - 1].innerText || '';
+                    return allMd[allMd.length - 1].innerText || '';
+                }
+            """)
+            return (text or "").strip()
         except Exception:
             return ""
+
+    async def check_generation_state(self) -> dict:
+        return await self.page.evaluate("""
+            () => {
+                const items = document.querySelectorAll('div[data-virtual-list-item-key]');
+                if (!items.length) return { hasButton:false, isGenerating:false, text:'', itemCount:0 };
+                const lastItem = items[items.length - 1];
+                const allMd = lastItem.querySelectorAll('[class*="ds-markdown"]');
+                let text = '';
+                if (allMd.length > 0) {
+                    const thinkSelectors = [
+                        '[class*="think"]','[class*="Think"]','[class*="thought"]',
+                        '[class*="reasoning"]','[class*="_74c0879"]',
+                        '[class*="collapse"]','[class*="Collapse"]','details',
+                    ];
+                    const thinkContainers = [];
+                    thinkSelectors.forEach(sel => {
+                        lastItem.querySelectorAll(sel).forEach(el => thinkContainers.push(el));
+                    });
+                    const replyMds = [];
+                    for (const md of allMd) {
+                        let inside = false;
+                        for (const tc of thinkContainers) {
+                            if (tc.contains(md) && tc !== md) { inside = true; break; }
+                        }
+                        if (!inside) replyMds.push(md);
+                    }
+                    if (replyMds.length > 0) text = replyMds[replyMds.length - 1].innerText || '';
+                    else text = allMd[allMd.length - 1].innerText || '';
+                }
+                const buttons = lastItem.querySelectorAll('div[role="button"]');
+                const hasButton = buttons.length > 0;
+                const stopBtn = document.querySelector('[class*="stop"], [class*="square"]');
+                const isGenerating = !!stopBtn && stopBtn.offsetParent !== null;
+                return { hasButton, isGenerating, text, itemCount: items.length };
+            }
+        """)
 
     async def is_alive(self) -> bool:
         try:
@@ -260,17 +436,6 @@ class ChatPage:
             return True
         except Exception:
             return False
-
-
-def _is_censored(text: str) -> bool:
-    text = text.strip()
-    if not text:
-        return False
-    for phrase in CENSORSHIP_PHRASES:
-        if phrase in text:
-            if len(text) < 100:
-                return True
-    return False
 
 
 class BrowserManager:
@@ -407,7 +572,6 @@ class BrowserManager:
     async def _start_with_playwright(self):
         from playwright.async_api import async_playwright
         self.playwright = await async_playwright().start()
-
         try:
             self.browser = await self.playwright.firefox.launch(
                 headless=self.headless, args=["--no-sandbox"]
@@ -500,6 +664,7 @@ class BrowserManager:
         try:
             cp.request_count += 1
 
+            # 检查页面是否存活
             if not await cp.is_alive():
                 print(f"  [{req_id}] 页面 #{cp.page_id} 已死，恢复中...")
                 try:
@@ -511,224 +676,152 @@ class BrowserManager:
                     )
                     await asyncio.sleep(2)
                     cp.page = new_page
+                    cp._monitor_injected = False
                 except Exception as e:
                     yield f"[错误] 页面恢复失败: {e}"
                     return
 
-            # ========== 新对话 & 记录基线 ==========
+            # 开新对话
             await cp.start_new_chat()
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
+            # 注入监控脚本 & 重置状态
+            await cp.ensure_monitor()
+            await cp.reset_monitor()
+
+            # 记录基线
             baseline_item_count = await cp.get_conversation_item_count()
-            print(f"  [{req_id}] 基线对话项数: {baseline_item_count}")
 
+            # 发送消息
             await cp.type_and_send(message)
-            print(f"  [{req_id}] 等待回复...")
+            print(f"  [{req_id}] 消息已发送，等待回复...")
 
             # ═══════════════════════════════════════════════════
-            # 核心改进：
-            # 1. 无论任何状态，只要有新文本就立即 yield（不再受按钮/生成状态门控）
-            # 2. 用"文本稳定 + 非生成中"作为主要完成判据
-            # 3. 按钮出现作为辅助完成确认
-            # 4. 最终读取用额外等待确保拿到完整文本
+            # 高性能流式读取：
+            # 1. JS 端 MutationObserver 实时追踪 DOM 变化
+            # 2. Python 端高频 flush 增量文本
+            # 3. 审查检测在 JS 端完成，确保快照不丢失
             # ═══════════════════════════════════════════════════
 
-            max_wait_seconds = 600
-            poll_interval = 0.5  # 从 0.3 调大到 0.5，减少 DOM 压力
-
-            yielded_length = 0
-            best_snapshot = ""
-            last_text = ""
-            generation_started = False
-            new_response_appeared = False
-            stable_ticks = 0          # 文本不再变化的连续 tick 数
-            stable_threshold = 6      # 3 秒 (6 * 0.5) 文本稳定就认为完成
+            max_wait = 600
+            poll_interval = 0.1  # 100ms 高频轮询，配合 JS 端 MutationObserver
+            total_yielded = 0
             finished = False
-            resend_attempted = False
+            new_response_seen = False
+            gen_started = False
+            no_data_ticks = 0
+            btn_stable_ticks = 0
+            start_time = time.time()
 
-            total_ticks = int(max_wait_seconds / poll_interval)
-
-            for tick in range(total_ticks):
+            while (time.time() - start_time) < max_wait:
                 await asyncio.sleep(poll_interval)
 
-                try:
-                    state = await cp.check_generation_state()
-                except Exception:
+                # 从 JS 端获取增量数据
+                data = await cp.flush_chunks()
+
+                if data is None:
+                    # 监控脚本可能丢失，重新注入
+                    await cp.ensure_monitor()
+                    no_data_ticks += 1
+                    if no_data_ticks > 100:  # 10秒无数据
+                        # fallback 到传统读取
+                        print(f"  [{req_id}] ⚠️ 监控脚本无响应，切换传统模式")
+                        async for chunk in self._fallback_stream(cp, message, req_id, baseline_item_count):
+                            yield chunk
+                        finished = True
+                        break
                     continue
 
-                has_button = state.get("hasButton", False)
-                is_generating = state.get("isGenerating", False)
-                current_text = (state.get("text") or "").strip()
-                item_count = state.get("itemCount", 0)
-                elapsed = (tick + 1) * poll_interval
+                no_data_ticks = 0
+                chunks = data.get("chunks", [])
+                is_finished = data.get("finished", False)
+                is_generating = data.get("isGenerating", False)
+                has_button = data.get("hasButton", False)
+                best_len = data.get("bestLen", 0)
+                current_len = data.get("currentLen", 0)
+                item_count = data.get("itemCount", 0)
+                gen_started_js = data.get("generationStarted", False)
 
-                # ———— 阶段 1：等待新回复出现 ————
-                if not new_response_appeared:
-                    if item_count > baseline_item_count:
-                        new_response_appeared = True
-                        print(f"  [{req_id}] 📬 新对话项出现 "
-                              f"({baseline_item_count} -> {item_count})")
-                    elif is_generating:
-                        new_response_appeared = True
-                        print(f"  [{req_id}] 📬 检测到生成开始")
+                # 检测新回复
+                if not new_response_seen:
+                    if item_count > baseline_item_count or is_generating or gen_started_js:
+                        new_response_seen = True
+                        print(f"  [{req_id}] 📬 新回复出现")
                     else:
-                        # 定期日志
-                        if tick > 0 and tick % int(15 / poll_interval) == 0:
-                            print(f"  [{req_id}] ⏳ {elapsed:.0f}s "
-                                  f"等待新回复... items={item_count}")
-
-                        # 30 秒没出现，尝试重发一次
-                        if elapsed > 30 and not resend_attempted:
-                            resend_attempted = True
-                            print(f"  [{req_id}] ⚠️ 30秒未见新对话项，尝试重新发送")
-                            try:
-                                await cp.type_and_send(message)
-                                baseline_item_count = item_count
-                            except Exception as e:
-                                print(f"  [{req_id}] ❌ 重发失败: {e}")
-
+                        elapsed = time.time() - start_time
+                        if elapsed > 30 and not is_generating:
+                            print(f"  [{req_id}] ⚠️ 30秒未见回复，重试发送")
+                            await cp.reset_monitor()
+                            await cp.type_and_send(message)
+                            baseline_item_count = item_count
                         if elapsed > 60:
-                            print(f"  [{req_id}] ❌ 60秒无新对话项，放弃")
+                            print(f"  [{req_id}] ❌ 60秒超时无回复")
                             break
                         continue
 
-                # ———— 跟踪生成状态 ————
-                if is_generating and not generation_started:
-                    generation_started = True
+                if gen_started_js and not gen_started:
+                    gen_started = True
                     print(f"  [{req_id}] 🚀 生成开始")
 
-                # ———— 审查检测 ————
-                if (current_text and
-                    len(best_snapshot) > 50 and
-                    len(current_text) < len(best_snapshot) * 0.5 and
-                    _is_censored(current_text)):
-                    print(f"  [{req_id}] 🛡️ 检测到审查替换！"
-                          f"当前={len(current_text)} vs 快照={len(best_snapshot)}")
-                    remaining = best_snapshot[yielded_length:]
-                    if remaining:
-                        yield remaining
+                # 输出增量
+                for chunk in chunks:
+                    if chunk:
+                        yield chunk
+                        total_yielded += len(chunk)
+
+                # 完成检测
+                if is_finished:
+                    print(f"  [{req_id}] ✅ JS端检测完成 "
+                          f"(yielded={total_yielded}, best={best_len})")
                     finished = True
                     break
 
-                # ———— 更新快照 ————
-                if current_text and len(current_text) >= len(best_snapshot):
-                    best_snapshot = current_text
-
-                # ———— 【核心修复】无条件流式输出增量 ————
-                # 不再检查 is_generating 或 has_button，有新文本就输出
-                if current_text and len(current_text) > yielded_length:
-                    new_content = current_text[yielded_length:]
-                    yield new_content
-                    yielded_length = len(current_text)
-                    stable_ticks = 0  # 有新文本，重置稳定计数
-
-                # ———— 文本稳定性跟踪 ————
-                if current_text == last_text and current_text:
-                    stable_ticks += 1
+                # 按钮稳定检测（JS 端没捕获到完成的兜底）
+                if has_button and not is_generating and new_response_seen:
+                    if current_len > 0:
+                        btn_stable_ticks += 1
+                        if btn_stable_ticks >= 20:  # 2秒稳定
+                            # 确保文本已经全部输出
+                            if current_len > total_yielded:
+                                # 可能有遗漏，直接读取
+                                full_text = await cp.get_best_text()
+                                if len(full_text) > total_yielded:
+                                    remaining = full_text[total_yielded:]
+                                    yield remaining
+                                    total_yielded += len(remaining)
+                            print(f"  [{req_id}] ✅ 按钮稳定完成 "
+                                  f"(yielded={total_yielded})")
+                            finished = True
+                            break
+                    else:
+                        btn_stable_ticks += 1
+                        if btn_stable_ticks >= 50:  # 5秒有按钮但无文本
+                            print(f"  [{req_id}] ⚠️ 有按钮但无文本，尝试直接读取")
+                            fallback_text = await cp.read_response_text()
+                            if fallback_text:
+                                yield fallback_text
+                                total_yielded += len(fallback_text)
+                            finished = True
+                            break
                 else:
-                    stable_ticks = 0
-                last_text = current_text
+                    btn_stable_ticks = 0
 
-                # ———— 完成检测（多条件综合判断）————
+                # 进度日志
+                elapsed = time.time() - start_time
+                if int(elapsed) % 20 == 0 and int(elapsed) > 0 and int(elapsed * 10) % 200 < 2:
+                    print(f"  [{req_id}] ⏳ {elapsed:.0f}s "
+                          f"yielded={total_yielded} best={best_len} "
+                          f"gen={is_generating} btn={has_button}")
 
-                # 条件 A：有按钮 + 非生成中 + 文本稳定 ≥ 1秒
-                if (has_button and not is_generating and
-                        stable_ticks >= int(1.0 / poll_interval) and
-                        new_response_appeared and current_text):
-                    # 最终确认：再读一次确保拿到完整文本
-                    await asyncio.sleep(0.5)
-                    try:
-                        final_state = await cp.check_generation_state()
-                        final_text = (final_state.get("text") or "").strip()
-                        if final_text and len(final_text) > yielded_length:
-                            yield final_text[yielded_length:]
-                            yielded_length = len(final_text)
-                        if len(final_text) > len(best_snapshot):
-                            best_snapshot = final_text
-                    except Exception:
-                        pass
-
-                    # 审查最终检查
-                    final_check_text = best_snapshot if len(best_snapshot) > yielded_length else current_text
-                    if (_is_censored(final_check_text) and
-                            len(best_snapshot) > len(final_check_text) * 1.5):
-                        remaining = best_snapshot[yielded_length:]
-                        if remaining:
-                            yield remaining
-                        print(f"  [{req_id}] 🛡️ 完成时审查，使用快照")
-                    
-                    print(f"  [{req_id}] ✅ 正常完成 {max(yielded_length, len(best_snapshot))} 字符")
-                    finished = True
-                    break
-
-                # 条件 B：文本稳定很久 + 非生成中（按钮可能没出现）
-                if (stable_ticks >= stable_threshold and
-                        not is_generating and
-                        (generation_started or new_response_appeared) and
-                        current_text):
-                    # 额外等待一下，给按钮出现的时间，但不阻塞输出
-                    await asyncio.sleep(1.0)
-                    try:
-                        final_state = await cp.check_generation_state()
-                        final_text = (final_state.get("text") or "").strip()
-                        still_generating = final_state.get("isGenerating", False)
-
-                        if still_generating:
-                            # 原来还在生成，重置稳定计数继续等
-                            stable_ticks = 0
-                            if final_text and len(final_text) > yielded_length:
-                                yield final_text[yielded_length:]
-                                yielded_length = len(final_text)
-                            continue
-
-                        if final_text and len(final_text) > yielded_length:
-                            yield final_text[yielded_length:]
-                            yielded_length = len(final_text)
-                        if len(final_text) > len(best_snapshot):
-                            best_snapshot = final_text
-                    except Exception:
-                        pass
-
-                    print(f"  [{req_id}] ✅ 稳定完成 {max(yielded_length, len(best_snapshot))} 字符")
-                    finished = True
-                    break
-
-                # ———— 进度日志 ————
-                if tick > 0 and tick % int(20 / poll_interval) == 0:
-                    print(
-                        f"  [{req_id}] ⏳ {elapsed:.0f}s "
-                        f"len={len(current_text)} yielded={yielded_length} "
-                        f"gen={is_generating} btn={has_button} "
-                        f"stable={stable_ticks} snapshot={len(best_snapshot)}"
-                    )
-
-                # ———— 硬超时 ————
-                if (elapsed > 60 and
-                        not generation_started and
-                        not current_text and
-                        new_response_appeared):
-                    print(f"  [{req_id}] ❌ 60秒无回复内容")
-                    break
-
-            # ———— 最终兜底 ————
+            # 兜底
             if not finished:
-                # 再做一次最终读取
-                try:
-                    await asyncio.sleep(1)
-                    final_text = await cp.read_response_text()
-                    if final_text and len(final_text) > yielded_length:
-                        yield final_text[yielded_length:]
-                        yielded_length = len(final_text)
-                        print(f"  [{req_id}] 📋 兜底最终读取: {len(final_text)} 字符")
-                except Exception:
-                    pass
-
-                if best_snapshot and yielded_length < len(best_snapshot):
-                    remaining = best_snapshot[yielded_length:]
-                    if remaining:
-                        yield remaining
-                    print(f"  [{req_id}] 📋 兜底快照: {len(best_snapshot)} 字符")
-                elif yielded_length == 0:
+                best_text = await cp.get_best_text()
+                if best_text and len(best_text) > total_yielded:
+                    remaining = best_text[total_yielded:]
+                    yield remaining
+                    total_yielded += len(remaining)
+                    print(f"  [{req_id}] 📋 兜底快照: {len(best_text)} 字符")
+                elif total_yielded == 0:
                     fallback = await cp.read_response_text()
                     if fallback:
                         yield fallback
@@ -737,7 +830,9 @@ class BrowserManager:
                         yield "抱歉，未能获取到响应。请稍后重试。"
                         print(f"  [{req_id}] ❌ 完全无响应")
 
-            print(f"  [{req_id}] 📊 页面#{cp.page_id} 请求完成")
+            print(f"  [{req_id}] 📊 页面#{cp.page_id} 完成 "
+                  f"(总输出: {total_yielded} 字符, "
+                  f"耗时: {time.time()-start_time:.1f}s)")
 
         except Exception as e:
             print(f"  [{req_id}] ❌ {e}")
@@ -748,6 +843,96 @@ class BrowserManager:
         finally:
             if cp:
                 self._release_page(cp)
+
+    async def _fallback_stream(
+        self, cp: ChatPage, message: str, req_id: int,
+        baseline_item_count: int
+    ) -> AsyncGenerator[str, None]:
+        """传统轮询模式作为兜底"""
+        poll_interval = 0.2
+        max_wait = 600
+        last_text = ""
+        best_snapshot = ""
+        yielded_length = 0
+        generation_started = False
+        new_response_seen = False
+        idle_ticks = 0
+        btn_stable_ticks = 0
+        start_time = time.time()
+
+        while (time.time() - start_time) < max_wait:
+            await asyncio.sleep(poll_interval)
+
+            try:
+                state = await cp.check_generation_state()
+            except Exception:
+                continue
+
+            has_button = state.get("hasButton", False)
+            is_generating = state.get("isGenerating", False)
+            current_text = (state.get("text") or "").strip()
+            item_count = state.get("itemCount", 0)
+
+            if not new_response_seen:
+                if item_count > baseline_item_count or is_generating:
+                    new_response_seen = True
+                else:
+                    if time.time() - start_time > 60:
+                        break
+                    continue
+
+            if is_generating and not generation_started:
+                generation_started = True
+
+            # 审查检测
+            if (current_text and len(best_snapshot) > 50 and
+                len(current_text) < len(best_snapshot) * 0.5 and
+                _is_censored(current_text)):
+                remaining = best_snapshot[yielded_length:]
+                if remaining:
+                    yield remaining
+                return
+
+            if current_text and len(current_text) >= len(best_snapshot):
+                best_snapshot = current_text
+
+            if current_text and len(current_text) > yielded_length:
+                if is_generating or (not has_button and generation_started):
+                    new_content = current_text[yielded_length:]
+                    yield new_content
+                    yielded_length = len(current_text)
+                    idle_ticks = 0
+                    btn_stable_ticks = 0
+
+            if has_button and not is_generating:
+                if generation_started or (new_response_seen and current_text):
+                    btn_stable_ticks += 1
+                    if btn_stable_ticks >= 10:
+                        if current_text and len(current_text) > yielded_length:
+                            yield current_text[yielded_length:]
+                        return
+            else:
+                btn_stable_ticks = 0
+
+            if current_text == last_text:
+                idle_ticks += 1
+            else:
+                idle_ticks = 0
+                last_text = current_text
+
+            if (idle_ticks > 150 and not is_generating and
+                (generation_started or new_response_seen)):
+                if current_text and len(current_text) > yielded_length:
+                    yield current_text[yielded_length:]
+                return
+
+        # 兜底
+        if best_snapshot and yielded_length < len(best_snapshot):
+            yield best_snapshot[yielded_length:]
+        elif yielded_length == 0:
+            fallback = await cp.read_response_text()
+            if fallback:
+                yield fallback
 
     async def is_alive(self) -> bool:
         if not self._ready or not self._pages:
@@ -771,7 +956,7 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "stream-with-anti-censorship",
+            "mode": "observer-stream-anti-censorship",
             "has_token": True,
             "cookie_count": 0,
             "page_count": len(self._pages),
