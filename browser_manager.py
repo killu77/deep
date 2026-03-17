@@ -2,6 +2,7 @@
 # 基于探针 probe_20260316_111934.json 精确数据编写
 # 核心策略：DOM 轮询 + 复制按钮(剪贴板拦截) + 审查快照
 
+import re
 import os
 import sys
 import time
@@ -61,6 +62,178 @@ INSTALL_CLIPBOARD_HOOK_JS = """
 }
 """
 
+# 在 browser_manager.py 顶部，CENSORSHIP_PHRASES 后面添加
+
+import re
+
+def _html_to_markdown(html: str) -> str:
+    """
+    轻量 HTML→Markdown 转换
+    专门针对 DeepSeek 的 ds-markdown 输出结构优化
+    不需要任何第三方库
+    """
+    if not html:
+        return ""
+
+    text = html
+
+    # ══ 预处理：移除残留的按钮/工具栏文本 ══
+    text = re.sub(r'<div[^>]*class="[^"]*(?:copy|toolbar|code-header|actions)[^"]*"[^>]*>.*?</div>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<button[^>]*>.*?</button>', '', text, flags=re.DOTALL)
+
+    # ══ 代码块 ══
+    # DeepSeek 代码块结构: <pre><code class="language-xxx">...</code></pre>
+    def replace_code_block(m):
+        attrs = m.group(1) or ''
+        code = m.group(2)
+        # 提取语言
+        lang_match = re.search(r'class="[^"]*language-(\w+)', attrs)
+        lang = lang_match.group(1) if lang_match else ''
+        # 解码 HTML 实体
+        code = _decode_entities(code)
+        # 移除内部标签
+        code = re.sub(r'<[^>]+>', '', code)
+        return f'\n```{lang}\n{code}\n```\n'
+
+    text = re.sub(r'<pre[^>]*>\s*<code([^>]*)>(.*?)</code>\s*</pre>', replace_code_block, text, flags=re.DOTALL)
+
+    # 独立的 <code>（行内代码）
+    def replace_inline_code(m):
+        code = _decode_entities(m.group(1))
+        code = re.sub(r'<[^>]+>', '', code)
+        return f'`{code}`'
+
+    text = re.sub(r'<code[^>]*>(.*?)</code>', replace_inline_code, text, flags=re.DOTALL)
+
+    # ══ 标题 ══
+    for i in range(6, 0, -1):
+        text = re.sub(
+            rf'<h{i}[^>]*>(.*?)</h{i}>',
+            lambda m, level=i: f'\n{"#" * level} {_strip_tags(m.group(1))}\n',
+            text, flags=re.DOTALL
+        )
+
+    # ══ 加粗/斜体 ══
+    text = re.sub(r'<strong[^>]*>(.*?)</strong>', r'**\1**', text, flags=re.DOTALL)
+    text = re.sub(r'<b[^>]*>(.*?)</b>', r'**\1**', text, flags=re.DOTALL)
+    text = re.sub(r'<em[^>]*>(.*?)</em>', r'*\1*', text, flags=re.DOTALL)
+    text = re.sub(r'<i[^>]*>(.*?)</i>', r'*\1*', text, flags=re.DOTALL)
+
+    # ══ 链接 ══
+    text = re.sub(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', r'[\2](\1)', text, flags=re.DOTALL)
+
+    # ══ 列表 ══
+    # 有序列表
+    def replace_ol(m):
+        content = m.group(1)
+        items = re.findall(r'<li[^>]*>(.*?)</li>', content, flags=re.DOTALL)
+        result = '\n'
+        for idx, item in enumerate(items, 1):
+            item_text = _strip_tags(item).strip()
+            # 处理多行列表项
+            lines = item_text.split('\n')
+            result += f'{idx}. {lines[0]}\n'
+            for line in lines[1:]:
+                if line.strip():
+                    result += f'   {line.strip()}\n'
+        return result + '\n'
+
+    text = re.sub(r'<ol[^>]*>(.*?)</ol>', replace_ol, text, flags=re.DOTALL)
+
+    # 无序列表
+    def replace_ul(m):
+        content = m.group(1)
+        items = re.findall(r'<li[^>]*>(.*?)</li>', content, flags=re.DOTALL)
+        result = '\n'
+        for item in items:
+            item_text = _strip_tags(item).strip()
+            lines = item_text.split('\n')
+            result += f'- {lines[0]}\n'
+            for line in lines[1:]:
+                if line.strip():
+                    result += f'  {line.strip()}\n'
+        return result + '\n'
+
+    text = re.sub(r'<ul[^>]*>(.*?)</ul>', replace_ul, text, flags=re.DOTALL)
+
+    # ══ 引用块 ══
+    def replace_blockquote(m):
+        content = _strip_tags(m.group(1)).strip()
+        lines = content.split('\n')
+        return '\n' + '\n'.join(f'> {line}' for line in lines) + '\n'
+
+    text = re.sub(r'<blockquote[^>]*>(.*?)</blockquote>', replace_blockquote, text, flags=re.DOTALL)
+
+    # ══ 段落和换行 ══
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    text = re.sub(r'<p[^>]*>(.*?)</p>', lambda m: f'\n{m.group(1)}\n', text, flags=re.DOTALL)
+    text = re.sub(r'<div[^>]*>(.*?)</div>', lambda m: f'\n{m.group(1)}\n', text, flags=re.DOTALL)
+
+    # ══ 水平线 ══
+    text = re.sub(r'<hr[^>]*/?\s*>', '\n---\n', text)
+
+    # ══ 表格 ══
+    def replace_table(m):
+        table_html = m.group(0)
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, flags=re.DOTALL)
+        if not rows:
+            return _strip_tags(table_html)
+
+        result_rows = []
+        for row in rows:
+            cells = re.findall(r'<t[hd][^>]*>(.*?)</t[hd]>', row, flags=re.DOTALL)
+            cells = [_strip_tags(c).strip() for c in cells]
+            result_rows.append('| ' + ' | '.join(cells) + ' |')
+
+        if len(result_rows) >= 1:
+            # 第一行后加分隔线
+            header = result_rows[0]
+            col_count = header.count('|') - 1
+            separator = '| ' + ' | '.join(['---'] * col_count) + ' |'
+            return '\n' + header + '\n' + separator + '\n' + '\n'.join(result_rows[1:]) + '\n'
+
+        return '\n'.join(result_rows)
+
+    text = re.sub(r'<table[^>]*>.*?</table>', replace_table, text, flags=re.DOTALL)
+
+    # ══ 清理残留标签 ══
+    text = re.sub(r'<span[^>]*>(.*?)</span>', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'<[^>]+>', '', text)
+
+    # ══ 解码 HTML 实体 ══
+    text = _decode_entities(text)
+
+    # ══ 清理空行 ══
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = text.strip()
+
+    return text
+
+
+def _strip_tags(html: str) -> str:
+    """移除 HTML 标签，保留文本"""
+    # 但保留 strong/em 的 markdown 标记
+    text = re.sub(r'<strong[^>]*>(.*?)</strong>', r'**\1**', html, flags=re.DOTALL)
+    text = re.sub(r'<em[^>]*>(.*?)</em>', r'*\1*', text, flags=re.DOTALL)
+    text = re.sub(r'<code[^>]*>(.*?)</code>', r'`\1`', text, flags=re.DOTALL)
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    return _decode_entities(text)
+
+
+def _decode_entities(text: str) -> str:
+    """解码 HTML 实体"""
+    text = text.replace('&amp;', '&')
+    text = text.replace('&lt;', '<')
+    text = text.replace('&gt;', '>')
+    text = text.replace('&quot;', '"')
+    text = text.replace('&#39;', "'")
+    text = text.replace('&nbsp;', ' ')
+    text = text.replace('&#x27;', "'")
+    text = text.replace('&#x2F;', '/')
+    return text
+
+
 # ═══════════════════════════════════════════════════════════════
 # 一次性读取所有状态（基于探针确认的精确结构）
 #
@@ -81,6 +254,7 @@ READ_STATE_JS = """
     const R = {
         domText: '',
         domLen: 0,
+        domHtml: '',
         thinkLen: 0,
         hasButton: false,
         buttonCount: 0,
@@ -103,6 +277,7 @@ READ_STATE_JS = """
     const msgDiv = lastItem.querySelector('div.ds-message');
     if (!msgDiv) return R;
 
+    // ══ 找正式回复的 ds-markdown ══
     let replyMd = null;
     const directChildren = msgDiv.children;
     for (let i = directChildren.length - 1; i >= 0; i--) {
@@ -116,83 +291,33 @@ READ_STATE_JS = """
     }
 
     if (replyMd) {
-        const excludeSet = new Set();
-        const cites = replyMd.querySelectorAll('span.ds-markdown-cite');
-        for (let i = 0; i < cites.length; i++) {
-            const parentA = cites[i].closest('a');
-            excludeSet.add(parentA || cites[i]);
-        }
-        const searchBars = replyMd.querySelectorAll('.ffdab56b, .ddbfd84f');
-        for (let i = 0; i < searchBars.length; i++) {
-            excludeSet.add(searchBars[i]);
-        }
+        // ══ 提取 HTML（用于转 Markdown）══
+        // 先克隆，移除不需要的元素
+        const clone = replyMd.cloneNode(true);
 
-        const BLOCK_TAGS = new Set([
-            'P','DIV','H1','H2','H3','H4','H5','H6',
-            'LI','OL','UL','BLOCKQUOTE','PRE','HR','TABLE',
-            'TR','THEAD','TBODY','BR'
-        ]);
+        // 移除引用角标
+        clone.querySelectorAll('span.ds-markdown-cite').forEach(cite => {
+            const parentA = cite.closest('a');
+            (parentA || cite).remove();
+        });
 
-        const walker = document.createTreeWalker(
-            replyMd,
-            NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
-            {
-                acceptNode: function(node) {
-                    // 元素节点：排除集合命中则 REJECT（跳过整个子树）
-                    if (node.nodeType === 1 && excludeSet.has(node)) {
-                        return NodeFilter.FILTER_REJECT;
-                    }
-                    return NodeFilter.FILTER_ACCEPT;
-                }
-            }
-        );
+        // 移除搜索来源栏
+        clone.querySelectorAll('.ffdab56b, .ddbfd84f').forEach(el => el.remove());
 
-        const parts = [];
-        let lastWasBlock = false;
-        let node;
+        // 移除代码块中的"复制""下载"按钮
+        clone.querySelectorAll('div.ds-markdown-code-copy-button, button[class*="copy"], div[class*="code-header"], div[class*="toolbar"]').forEach(el => el.remove());
 
-        while (node = walker.nextNode()) {
-            if (node.nodeType === 1) {
-                if (BLOCK_TAGS.has(node.tagName)) {
-                    // 【修改】块级元素前：只在已有内容且上一个不是块时加换行
-                    if (parts.length > 0 && !lastWasBlock) {
-                        parts.push('\\n');
-                    }
-                    lastWasBlock = true;
-                    if (node.tagName === 'BR') {
-                        parts.push('\\n');
-                    }
-                    // 【新增】列表项前加符号
-                    if (node.tagName === 'LI') {
-                        const parent = node.parentElement;
-                        if (parent && parent.tagName === 'OL') {
-                            // 有序列表：计算序号
-                            const idx = Array.from(parent.children)
-                                .filter(c => c.tagName === 'LI')
-                                .indexOf(node) + 1;
-                            parts.push(idx + '. ');
-                        } else {
-                            parts.push('• ');
-                        }
-                    }
-                }
-            } else if (node.nodeType === 3) {
-                const t = node.textContent;
-                if (t && t.length > 0) {
-                    parts.push(t);
-                    lastWasBlock = false;
-                }
-            }
-        }
+        // 移除所有 class*="copy" 或 class*="download" 的按钮元素
+        clone.querySelectorAll('[class*="copy-btn"], [class*="download"], [class*="code-actions"]').forEach(el => el.remove());
 
-        let text = parts.join('');
-        text = text.replace(/\\n{3,}/g, '\\n\\n');
-        text = text.replace(/^\\n+/, '');
+        R.domHtml = clone.innerHTML;
 
-        R.domText = text.trim();
+        // 纯文本用于长度比较和审查检测
+        R.domText = clone.innerText || '';
         R.domLen = R.domText.length;
     }
 
+    // ══ 思考区域 ══
     const thinkDiv = msgDiv.querySelector('div.ds-think-content');
     if (thinkDiv) {
         const thinkMd = thinkDiv.querySelector('div.ds-markdown');
@@ -201,6 +326,7 @@ READ_STATE_JS = """
         }
     }
 
+    // ══ 按钮 ══
     const btnContainer = lastItem.querySelector('div._965abe9');
     if (btnContainer) {
         const btns = btnContainer.querySelectorAll('div.ds-icon-button');
@@ -212,6 +338,7 @@ READ_STATE_JS = """
         R.hasButton = btns.length >= 3;
     }
 
+    // ══ 生成中检测 ══
     R.isGenerating = !R.isComplete && R.itemCount >= 2;
     if (!R.isGenerating) {
         const thinkAnim = lastItem.querySelector('span.e4b3a110');
@@ -223,6 +350,7 @@ READ_STATE_JS = """
         }
     }
 
+    // ══ 剪贴板 ══
     if (window.__clipData) {
         R.clipText = window.__clipData.text || '';
         R.clipLen = R.clipText.length;
@@ -684,11 +812,19 @@ class BrowserManager:
             # ═══════════════════════════════════════════
             max_wait = 600
             poll_interval = 0.4
-            yielded_len = 0
-            best_text = ""        # 抗审查快照
+
+            # 纯文本快照（用于审查检测，基准一致）
+            best_text = ""
+            # Markdown 快照（用于实际输出）
+            best_md = ""
+            # HTML 快照（最后的保命手段）
+            best_html = ""
+
+            yielded_md_len = 0     # 已输出的 Markdown 字符数
             gen_started = False
             no_change_count = 0
             prev_len = 0
+            prev_html_len = 0      # 上次 HTML 长度（用于判断是否需要重新转换）
             start_ts = time.time()
             scroll_counter = 0
 
@@ -710,7 +846,7 @@ class BrowserManager:
                 await asyncio.sleep(poll_interval)
                 scroll_counter += 1
 
-                # 每 12 次（~5秒）滚动一下
+                # 每 ~5 秒滚动一下（对抗虚拟滚动截断）
                 if scroll_counter % 12 == 0:
                     await cp.scroll_to_bottom()
 
@@ -718,6 +854,8 @@ class BrowserManager:
                 state = await cp.read_state()
                 dom_text = state.get("domText", "")
                 dom_len = state.get("domLen", 0)
+                dom_html = state.get("domHtml", "")
+                dom_html_len = len(dom_html)
                 think_len = state.get("thinkLen", 0)
                 is_complete = state.get("isComplete", False)
                 has_button = state.get("hasButton", False)
@@ -728,74 +866,121 @@ class BrowserManager:
                 if not gen_started and (dom_len > 0 or think_len > 0 or is_gen):
                     gen_started = True
                     no_change_count = 0
-                    print(f"  [#{req_id}] 🚀 开始 (think={think_len} reply={dom_len} gen={is_gen})")
+                    print(f"  [#{req_id}] 🚀 开始 "
+                          f"(think={think_len} reply={dom_len} gen={is_gen})")
 
-                # 更新快照
+                # ══ 持续保存快照（生成中就一直存）══
                 if dom_len > len(best_text):
                     best_text = dom_text
+                if dom_html and dom_html_len > len(best_html):
+                    best_html = dom_html
 
-                # ── 审查检测 ──
+                # ══ HTML → Markdown（仅在 HTML 有变化时转换）══
+                current_md = ""
+                if dom_html and dom_html_len != prev_html_len:
+                    current_md = _html_to_markdown(dom_html)
+                    prev_html_len = dom_html_len
+                    if len(current_md) > len(best_md):
+                        best_md = current_md
+                elif dom_html and dom_html_len == prev_html_len:
+                    # HTML 没变，复用上次的 best_md
+                    current_md = best_md
+
+                # ── 审查检测（用纯文本，基准一致）──
                 if (gen_started and len(best_text) > 80
-                    and dom_text and dom_len < len(best_text) * 0.4
-                    and _is_censored(dom_text)):
-                    print(f"  [#{req_id}] 🛡️ 审查! dom={dom_len} snap={len(best_text)}")
-                    remaining = best_text[yielded_len:]
+                        and dom_text and dom_len < len(best_text) * 0.4
+                        and _is_censored(dom_text)):
+                    print(f"  [#{req_id}] 🛡️ 审查! "
+                          f"dom={dom_len} snap={len(best_text)}")
+                    remaining = best_md[yielded_md_len:]
                     if remaining:
                         yield remaining
                     break
 
-                # ── 流式增量输出 ──
-                if dom_text and dom_len > yielded_len:
-                    new_part = dom_text[yielded_len:]
+                # ── 流式增量输出（Markdown 格式）──
+                if current_md and len(current_md) > yielded_md_len:
+                    new_part = current_md[yielded_md_len:]
                     if not is_complete:
-                        # 生成中: 直接输出
+                        # 生成中：直接输出
                         yield new_part
-                        yielded_len = dom_len
+                        yielded_md_len = len(current_md)
                         no_change_count = 0
                     elif not _is_censored(dom_text):
-                        # 已完成且非审查
+                        # 已完成且非审查：输出
                         yield new_part
-                        yielded_len = dom_len
+                        yielded_md_len = len(current_md)
 
-                # ── 完成检测 ──
-                # 探针发现: is_complete = className 含 _43c05b5
-                # 同时 has_button = 有5个功能按钮
+                # ══════════════════════════════════════════
+                # 完成检测
+                # ══════════════════════════════════════════
                 if gen_started and is_complete and has_button and btn_count >= 3:
-                    # 再等一下确认
-                    await asyncio.sleep(0.5)
+                    # 二次确认
+                    await asyncio.sleep(0.3)
                     confirm = await cp.read_state()
-                    if confirm.get("isComplete", False) and confirm.get("hasButton", False):
-                        # 滚到底再读一次
-                        await cp.scroll_to_bottom()
-                        await asyncio.sleep(0.3)
-                        final = await cp.read_state()
-                        final_text = final.get("domText", "")
-                        final_len = final.get("domLen", 0)
+                    if not (confirm.get("isComplete") and confirm.get("hasButton")):
+                        continue
 
+                    # 滚到底再读一次
+                    await cp.scroll_to_bottom()
+                    await asyncio.sleep(0.2)
+                    final = await cp.read_state()
+                    final_text = final.get("domText", "")
+                    final_html = final.get("domHtml", "")
+                    final_len = final.get("domLen", 0)
+
+                    # 检查此刻 DOM 是否已被审查替换
+                    dom_censored = _is_censored(final_text)
+
+                    if not dom_censored:
+                        # DOM 没被替换，更新快照
                         if final_len > len(best_text):
                             best_text = final_text
+                        if final_html and len(final_html) > len(best_html):
+                            best_html = final_html
+                        final_md = _html_to_markdown(final_html) if final_html else ""
+                        if len(final_md) > len(best_md):
+                            best_md = final_md
 
-                        # 输出剩余
-                        use_text = best_text if final_len < len(best_text) else final_text
-                        if len(use_text) > yielded_len:
-                            if not _is_censored(use_text):
-                                yield use_text[yielded_len:]
-                                yielded_len = len(use_text)
-                            else:
-                                remaining = best_text[yielded_len:]
-                                if remaining:
-                                    yield remaining
-                                    yielded_len = len(best_text)
-                                print(f"  [#{req_id}] 🛡️ 完成时审查")
+                    # 点复制按钮
+                    clip_text = await cp.click_copy_and_wait(timeout=3.0)
 
-                        # ══ 点复制按钮获取完整 markdown ══
-                        clip_text = await cp.click_copy_and_wait(timeout=3.0)
-                        if clip_text:
-                            print(f"  [#{req_id}] 📋 clip={len(clip_text)} dom={yielded_len}")
+                    # ── 决定最终输出来源 ──
+                    # 优先级:
+                    #   1. 剪贴板（非审查）→ 最完整的原生 Markdown
+                    #   2. best_md 快照 → 生成中积累的 HTML→MD
+                    #   3. best_html → HTML 快照再转一次
+                    final_output = None
+                    source = "none"
 
-                        print(f"  [#{req_id}] ✅ 完成: {yielded_len} 字 "
-                              f"(dom={final_len} clip={len(clip_text) if clip_text else 0})")
-                        break
+                    if clip_text and not _is_censored(clip_text):
+                        final_output = clip_text
+                        source = f"clip={len(clip_text)}"
+                    elif clip_text and _is_censored(clip_text):
+                        # 剪贴板被审查了，用快照
+                        print(f"  [#{req_id}] 🛡️ 剪贴板被审查! "
+                              f"clip={len(clip_text)} → 用快照")
+                        if best_md:
+                            final_output = best_md
+                            source = f"md_snap={len(best_md)}"
+                        elif best_html:
+                            final_output = _html_to_markdown(best_html)
+                            source = f"html_snap→md={len(final_output)}"
+                    else:
+                        # 没拿到剪贴板
+                        if best_md:
+                            final_output = best_md
+                            source = f"md_snap={len(best_md)}"
+                        elif best_html:
+                            final_output = _html_to_markdown(best_html)
+                            source = f"html_snap→md={len(final_output)}"
+
+                    # 补充未输出的部分
+                    if final_output and len(final_output) > yielded_md_len:
+                        yield final_output[yielded_md_len:]
+                        yielded_md_len = len(final_output)
+
+                    print(f"  [#{req_id}] ✅ 完成: {yielded_md_len} 字 ({source})")
+                    break
 
                 # ── 无进展检测 ──
                 if dom_len == prev_len:
@@ -805,50 +990,56 @@ class BrowserManager:
                     prev_len = dom_len
 
                 if no_change_count > int(90 / poll_interval):
-                    if gen_started and best_text:
-                        if len(best_text) > yielded_len:
-                            yield best_text[yielded_len:]
-                        print(f"  [#{req_id}] ⏰ 90s 无进展: {len(best_text)} 字")
+                    if gen_started and best_md:
+                        if len(best_md) > yielded_md_len:
+                            yield best_md[yielded_md_len:]
+                        print(f"  [#{req_id}] ⏰ 90s 无进展: {len(best_md)} 字")
                         break
                     elif not gen_started and elapsed > 120:
                         print(f"  [#{req_id}] ❌ 120s 无响应")
                         break
 
                 # ── 日志 ──
-                if scroll_counter % 37 == 0:  # ~15s
-                    print(f"  [#{req_id}] ⏳ {elapsed:.0f}s dom={dom_len} "
-                          f"think={think_len} out={yielded_len} "
-                          f"comp={is_complete} btn={btn_count}")
+                if scroll_counter % 37 == 0:
+                    print(f"  [#{req_id}] ⏳ {elapsed:.0f}s "
+                          f"dom={dom_len} md={yielded_md_len} "
+                          f"snap_md={len(best_md)} snap_html={len(best_html)} "
+                          f"think={think_len} comp={is_complete} btn={btn_count}")
 
             # ═══════════════════════════════════════════
-            # 兜底
+            # 兜底（完全没输出过内容时）
             # ═══════════════════════════════════════════
-            if yielded_len == 0:
+            if yielded_md_len == 0:
                 # 1) 点复制按钮
                 clip = await cp.click_copy_and_wait(timeout=5.0)
                 if clip and not _is_censored(clip):
                     yield clip
                     print(f"  [#{req_id}] 📋 兜底复制: {len(clip)} 字")
-                    return
-
-                # 2) 再读 DOM
-                await cp.scroll_to_bottom()
-                await asyncio.sleep(1)
-                st = await cp.read_state()
-                dt = st.get("domText", "")
-                if dt and not _is_censored(dt):
-                    yield dt
-                    print(f"  [#{req_id}] 📋 兜底DOM: {len(dt)} 字")
-                    return
-
-                # 3) 快照
-                if best_text:
-                    yield best_text
-                    print(f"  [#{req_id}] 📋 兜底快照: {len(best_text)} 字")
-                    return
-
-                yield "抱歉，未能获取到响应。请稍后重试。"
-                print(f"  [#{req_id}] ❌ 完全无响应")
+                elif best_md:
+                    # 2) MD 快照
+                    yield best_md
+                    print(f"  [#{req_id}] 📋 兜底md快照: {len(best_md)} 字")
+                elif best_html:
+                    # 3) HTML 快照转 MD
+                    md = _html_to_markdown(best_html)
+                    if md:
+                        yield md
+                        print(f"  [#{req_id}] 📋 兜底html→md: {len(md)} 字")
+                    else:
+                        yield "抱歉，未能获取到响应。请稍后重试。"
+                        print(f"  [#{req_id}] ❌ html转换失败")
+                else:
+                    # 4) 再读一次 DOM
+                    await cp.scroll_to_bottom()
+                    await asyncio.sleep(1)
+                    st = await cp.read_state()
+                    dt = st.get("domText", "")
+                    if dt and not _is_censored(dt):
+                        yield dt
+                        print(f"  [#{req_id}] 📋 兜底DOM纯文本: {len(dt)} 字")
+                    else:
+                        yield "抱歉，未能获取到响应。请稍后重试。"
+                        print(f"  [#{req_id}] ❌ 完全无响应")
 
         except Exception as e:
             print(f"  [#{req_id}] ❌ {e}")
@@ -859,6 +1050,7 @@ class BrowserManager:
         finally:
             if cp:
                 self._release_page(cp)
+
 
     async def is_alive(self) -> bool:
         if not self._ready or not self._pages:
