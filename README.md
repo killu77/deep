@@ -254,7 +254,7 @@ curl -X POST http://localhost:7860/v1/chat/completions \
 | `DEEPSEEK_TOKEN` | 仅 Token（如 `ds_token`），自动注入 localStorage | 无 |
 | `DEEPSEEK_COOKIES` | Cookie 数组 JSON（与 `DEEPSEEK_LOCAL_STORAGE` 配合） | 无 |
 | `DEEPSEEK_LOCAL_STORAGE` | localStorage 对象 JSON | 无 |
-| `API_SECRET_KEY` | **推荐**：API 密钥，用于接口鉴权 | `zxcvbnm` |
+| `API_SECRET_KEY` | **推荐**：API 密钥，用于接口鉴权 | `123456` |
 | `HEADLESS` | 是否以无头模式运行浏览器（本地调试时可设为 `false`） | `true` |
 | `MAX_CONCURRENT_PAGES` |  **推荐**：控制同时可用的浏览器页面（Tab）数量，默认为3，如果你的服务器内存小，建议调小，一个页面预留300mb | `3` |
 
