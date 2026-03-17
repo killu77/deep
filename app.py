@@ -26,7 +26,7 @@ from keepalive import KeepaliveService
 browser_mgr: BrowserManager = None
 keepalive_svc: KeepaliveService = None
 
-API_SECRET_KEY = os.getenv("API_SECRET_KEY", "zxcvbnm")
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "123456")
 security = HTTPBearer(auto_error=False)
 
 
